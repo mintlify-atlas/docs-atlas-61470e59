@@ -1,0 +1,216 @@
+---
+title: "monai.inferers"
+description: "Inference strategies for MONAI models — from simple forward passes to sliding window, patch-based, and diffusion inference."
+---
+
+The `monai.inferers` module provides inference wrappers that handle different strategies for running model predictions, including patch-based sliding window inference for large 3D volumes.
+
+## SimpleInferer
+
+Runs a direct forward pass through the network. Use this for small volumes that fit in GPU memory.
+
+```python
+from monai.inferers import SimpleInferer
+
+inferer = SimpleInferer()
+output = inferer(inputs, network)
+```
+
+## SlidingWindowInferer
+
+The primary inference strategy for large 3D medical images. Splits the input into overlapping patches (ROIs), runs inference on each, and blends the results.
+
+```python
+from monai.inferers import SlidingWindowInferer
+
+inferer = SlidingWindowInferer(
+    roi_size=(96, 96, 96),
+    sw_batch_size=4,
+    overlap=0.5,
+    mode="gaussian",
+    sigma_scale=0.125,
+    padding_mode="constant",
+    cval=0.0,
+    progress=True,
+)
+output = inferer(inputs, network)
+```
+
+<ParamField path="roi_size" type="Sequence[int] | int" required>
+  Size of the sliding window patch. E.g. `(96, 96, 96)` for 3D or `(256, 256)` for 2D.
+</ParamField>
+<ParamField path="sw_batch_size" type="int" default="1">
+  Number of patches to process in each forward pass. Higher values increase throughput but use more GPU memory.
+</ParamField>
+<ParamField path="overlap" type="float" default="0.25">
+  Fractional overlap between patches (0.0 to 1.0). Higher overlap reduces boundary artifacts but increases computation.
+</ParamField>
+<ParamField path="mode" type="str" default="constant">
+  Blending mode for overlapping patches. `"gaussian"` weights center voxels more heavily; `"constant"` uses uniform weights.
+</ParamField>
+<ParamField path="sigma_scale" type="float | Sequence[float]" default="0.125">
+  Standard deviation for Gaussian blending kernel, as a fraction of `roi_size`.
+</ParamField>
+<ParamField path="padding_mode" type="str" default="constant">
+  Padding mode when the volume edges don't align with the ROI. Options: `"constant"`, `"reflect"`, `"replicate"`, `"circular"`.
+</ParamField>
+<ParamField path="cval" type="float" default="0.0">
+  Constant value for padding when `padding_mode="constant"`.
+</ParamField>
+<ParamField path="sw_device" type="torch.device | str | None">
+  Device for patch computation. Defaults to the input device.
+</ParamField>
+<ParamField path="device" type="torch.device | str | None">
+  Device for aggregating patch outputs. Set to `"cpu"` to reduce GPU memory for large outputs.
+</ParamField>
+<ParamField path="progress" type="bool" default="False">
+  Show a `tqdm` progress bar during inference.
+</ParamField>
+<ParamField path="cache_roi_weight_map" type="bool" default="False">
+  Pre-compute and cache the Gaussian weight map. Useful when running inference on many images.
+</ParamField>
+<ParamField path="cpu_thresh" type="int | None">
+  If the number of voxels exceeds this threshold, move patch aggregation to CPU automatically.
+</ParamField>
+
+### Memory-saving patterns
+
+<Tabs>
+  <Tab title="CPU aggregation">
+    ```python
+    # Aggregate on CPU to save GPU memory for large outputs
+    inferer = SlidingWindowInferer(
+        roi_size=(160, 160, 160),
+        sw_batch_size=2,
+        overlap=0.5,
+        device="cpu",
+    )
+    ```
+  </Tab>
+  <Tab title="Automatic CPU fallback">
+    ```python
+    # Auto-move to CPU if output exceeds 300M voxels
+    inferer = SlidingWindowInferer(
+        roi_size=(96, 96, 96),
+        overlap=0.5,
+        cpu_thresh=300_000_000,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## SliceInferer
+
+Applies a 2D model slice-by-slice through a 3D volume.
+
+```python
+from monai.inferers import SliceInferer
+
+inferer = SliceInferer(
+    roi_size=(256, 256),
+    sw_batch_size=8,
+    spatial_dim=2,  # slice along the last spatial dimension
+)
+output = inferer(volume_3d, network_2d)
+```
+
+<ParamField path="spatial_dim" type="int" default="0">
+  The spatial dimension along which to slice. `0`=axial (for CHW→batch), `1`=coronal, `2`=sagittal.
+</ParamField>
+
+## PatchInferer
+
+Composable patch-based inference using separate `Splitter` and `Merger` components.
+
+```python
+from monai.inferers import PatchInferer, SlidingWindowSplitter, AvgMerger
+
+inferer = PatchInferer(
+    splitter=SlidingWindowSplitter(patch_size=(96, 96, 96), overlap=0.5),
+    merger_cls=AvgMerger,
+)
+output = inferer(inputs, network)
+```
+
+### Splitters
+
+| Class | Description |
+|-------|-------------|
+| `SlidingWindowSplitter` | Standard overlapping patch extraction |
+| `WSISlidingWindowSplitter` | Sliding window for whole slide images |
+
+### Mergers
+
+| Class | Description |
+|-------|-------------|
+| `AvgMerger` | Averages overlapping patch predictions |
+| `ZarrAvgMerger` | Zarr-backed merger for very large outputs |
+
+## DiffusionInferer
+
+Runs forward (training) and reverse (sampling) passes for diffusion models.
+
+```python
+from monai.inferers import DiffusionInferer
+
+inferer = DiffusionInferer(scheduler=scheduler)
+
+# Training: predict noise
+noise_pred = inferer(inputs=images, diffusion_model=model, noise=noise, timesteps=t)
+
+# Sampling: reverse diffusion
+samples, _ = inferer.sample(
+    input_noise=torch.randn(1, 1, 64, 64, 64),
+    diffusion_model=model,
+    scheduler=scheduler,
+    verbose=True,
+)
+```
+
+## LatentDiffusionInferer
+
+Combines a VAE encoder/decoder with a diffusion model for latent-space diffusion.
+
+```python
+from monai.inferers import LatentDiffusionInferer
+
+inferer = LatentDiffusionInferer(
+    scheduler=scheduler,
+    scale_factor=1.0,
+    ldm_latent_shape=[3, 8, 8, 8],
+    autoencoder_latent_shape=[3, 16, 16, 16],
+)
+
+# Training
+noise_pred = inferer(
+    inputs=images,
+    autoencoder_model=vae,
+    diffusion_model=unet,
+    noise=noise,
+    timesteps=t,
+)
+
+# Sampling
+samples, _ = inferer.sample(
+    input_noise=latent_noise,
+    autoencoder_model=vae,
+    diffusion_model=unet,
+    scheduler=scheduler,
+)
+```
+
+## sliding_window_inference (functional)
+
+A standalone function equivalent to `SlidingWindowInferer` for use without instantiating the class:
+
+```python
+from monai.inferers import sliding_window_inference
+
+output = sliding_window_inference(
+    inputs=image,
+    roi_size=(96, 96, 96),
+    sw_batch_size=4,
+    predictor=model,
+    overlap=0.5,
+)
+```

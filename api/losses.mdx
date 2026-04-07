@@ -1,0 +1,414 @@
+---
+title: 'monai.losses'
+description: 'Loss functions for medical image segmentation, registration, and generative modeling.'
+---
+
+The `monai.losses` module provides loss functions tailored for medical imaging, with particular focus on class-imbalanced segmentation tasks. All losses accept `(input, target)` tensors of shape `BNHW[D]` where `N` is the number of classes.
+
+<Note>
+For multi-class segmentation, pass raw logits as `input` and set either `sigmoid=True` (multi-label) or `softmax=True` (mutually exclusive classes). Set `to_onehot_y=True` when `target` is a single-channel label map rather than one-hot encoded.
+</Note>
+
+## Dice-based losses
+
+### DiceLoss
+
+Computes the average Dice coefficient loss. The most widely used loss for medical image segmentation.
+
+```python
+from monai.losses import DiceLoss
+import torch
+
+loss_fn = DiceLoss(
+    include_background=False,
+    to_onehot_y=True,
+    softmax=True,
+    smooth_nr=1e-5,
+    smooth_dr=1e-5,
+)
+
+output = model(input_image)       # shape: (B, C, H, W, D)
+target = label_map                # shape: (B, 1, H, W, D)
+loss = loss_fn(output, target)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  If `False`, excludes channel 0 (assumed to be background) from the loss computation. Useful when foreground structures are small.
+</ParamField>
+
+<ParamField path="to_onehot_y" type="bool" default="False">
+  Convert `target` from a label map to one-hot encoding using the number of classes from `input.shape[1]`.
+</ParamField>
+
+<ParamField path="softmax" type="bool" default="False">
+  Apply softmax to `input` before computing the loss. Use for mutually exclusive classes.
+</ParamField>
+
+<ParamField path="sigmoid" type="bool" default="False">
+  Apply sigmoid to `input` before computing the loss. Use for independent binary channels.
+</ParamField>
+
+<ParamField path="smooth_nr" type="float" default="1e-5">
+  Smoothing constant added to the numerator (intersection) to avoid division instability.
+</ParamField>
+
+<ParamField path="smooth_dr" type="float" default="1e-5">
+  Smoothing constant added to the denominator (union) to avoid NaN.
+</ParamField>
+
+<ParamField path="batch" type="bool" default="False">
+  If `True`, sums intersection and union across the batch dimension before dividing. Produces a single loss for the entire batch.
+</ParamField>
+
+<ParamField path="reduction" type="str" default="mean">
+  Reduction mode: `"none"`, `"mean"`, or `"sum"`.
+</ParamField>
+
+<ParamField path="weight" type="Sequence[float] | float | Tensor | None">
+  Per-class weights applied to the Dice scores.
+</ParamField>
+
+---
+
+### DiceCELoss
+
+Combines Dice loss and cross-entropy loss with configurable weighting.
+
+```python
+from monai.losses import DiceCELoss
+
+loss_fn = DiceCELoss(
+    include_background=False,
+    to_onehot_y=True,
+    softmax=True,
+    lambda_dice=1.0,
+    lambda_ce=1.0,
+)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Exclude background from the Dice component if `False`.
+</ParamField>
+
+<ParamField path="to_onehot_y" type="bool" default="False">
+  Convert target to one-hot for the Dice component.
+</ParamField>
+
+<ParamField path="softmax" type="bool" default="False">
+  Apply softmax before computing both components.
+</ParamField>
+
+<ParamField path="lambda_dice" type="float" default="1.0">
+  Weight applied to the Dice loss component.
+</ParamField>
+
+<ParamField path="lambda_ce" type="float" default="1.0">
+  Weight applied to the cross-entropy component.
+</ParamField>
+
+---
+
+### GeneralizedDiceLoss
+
+Generalised Dice loss where each class is weighted by the inverse of its frequency, improving performance on highly imbalanced datasets.
+
+```python
+from monai.losses import GeneralizedDiceLoss
+
+loss_fn = GeneralizedDiceLoss(
+    include_background=False,
+    to_onehot_y=True,
+    softmax=True,
+    w_type="square",
+)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Exclude background channel if `False`.
+</ParamField>
+
+<ParamField path="to_onehot_y" type="bool" default="False">
+  Convert target to one-hot.
+</ParamField>
+
+<ParamField path="softmax" type="bool" default="False">
+  Apply softmax to predictions.
+</ParamField>
+
+<ParamField path="w_type" type="str" default="square">
+  Weight type: `"square"` (inverse square of label sum), `"simple"` (inverse label sum), or `"uniform"`.
+</ParamField>
+
+<ParamField path="reduction" type="str" default="mean">
+  Reduction mode: `"none"`, `"mean"`, or `"sum"`.
+</ParamField>
+
+---
+
+### DiceFocalLoss
+
+Combines Dice loss and Focal loss, effective for small foreground regions with hard negatives.
+
+```python
+from monai.losses import DiceFocalLoss
+
+loss_fn = DiceFocalLoss(
+    include_background=False,
+    to_onehot_y=True,
+    softmax=True,
+    gamma=2.0,
+    lambda_dice=1.0,
+    lambda_focal=1.0,
+)
+```
+
+---
+
+### GeneralizedDiceFocalLoss
+
+Combines Generalised Dice loss and Focal loss.
+
+---
+
+## Focal & region-based losses
+
+### FocalLoss
+
+Focal loss down-weights easy negative examples to focus training on hard cases. Effective for class-imbalanced segmentation.
+
+```python
+from monai.losses import FocalLoss
+
+loss_fn = FocalLoss(
+    include_background=True,
+    to_onehot_y=False,
+    gamma=2.0,
+    alpha=0.25,
+    reduction="mean",
+)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Include background class in the loss.
+</ParamField>
+
+<ParamField path="to_onehot_y" type="bool" default="False">
+  Convert target to one-hot.
+</ParamField>
+
+<ParamField path="gamma" type="float" default="2.0">
+  Focusing parameter. Higher values reduce the loss contribution of easy examples.
+</ParamField>
+
+<ParamField path="alpha" type="Sequence[float] | float | None" default="None">
+  Per-class weighting factor. Scalar applies uniformly; sequence applies per class.
+</ParamField>
+
+<ParamField path="reduction" type="str" default="mean">
+  Reduction mode: `"none"`, `"mean"`, or `"sum"`.
+</ParamField>
+
+---
+
+### TverskyLoss
+
+Generalisation of Dice loss with separate weights for false positives (α) and false negatives (β). Set β > α to penalise missed detections more.
+
+```python
+from monai.losses import TverskyLoss
+
+loss_fn = TverskyLoss(
+    include_background=False,
+    to_onehot_y=True,
+    softmax=True,
+    alpha=0.3,
+    beta=0.7,
+)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Include background in loss computation.
+</ParamField>
+
+<ParamField path="to_onehot_y" type="bool" default="False">
+  Convert target to one-hot.
+</ParamField>
+
+<ParamField path="sigmoid" type="bool" default="False">
+  Apply sigmoid activation.
+</ParamField>
+
+<ParamField path="softmax" type="bool" default="False">
+  Apply softmax activation.
+</ParamField>
+
+<ParamField path="alpha" type="float" default="0.5">
+  Weight for false positives.
+</ParamField>
+
+<ParamField path="beta" type="float" default="0.5">
+  Weight for false negatives.
+</ParamField>
+
+---
+
+### HausdorffDTLoss
+
+Differentiable Hausdorff distance loss based on distance transforms. Encourages boundary precision rather than volumetric overlap.
+
+```python
+from monai.losses import HausdorffDTLoss
+
+loss_fn = HausdorffDTLoss(
+    include_background=False,
+    to_onehot_y=True,
+    sigmoid=True,
+    alpha=2.0,
+)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Include background channel.
+</ParamField>
+
+<ParamField path="to_onehot_y" type="bool" default="False">
+  Convert target to one-hot.
+</ParamField>
+
+<ParamField path="sigmoid" type="bool" default="False">
+  Apply sigmoid to predictions.
+</ParamField>
+
+<ParamField path="alpha" type="float" default="2.0">
+  Controls the penalty applied to large distance errors.
+</ParamField>
+
+**Variant**: `LogHausdorffDTLoss` — uses a logarithmic transformation for more stable training.
+
+---
+
+## Self-supervised losses
+
+### ContrastiveLoss
+
+NT-Xent style contrastive loss for self-supervised representation learning.
+
+```python
+from monai.losses import ContrastiveLoss
+
+loss_fn = ContrastiveLoss(temperature=0.05, batch_size=32)
+loss = loss_fn(representation1, representation2)
+```
+
+<ParamField path="temperature" type="float" default="0.5">
+  Temperature scaling for similarity logits.
+</ParamField>
+
+<ParamField path="batch_size" type="int" required>
+  Number of samples per batch.
+</ParamField>
+
+---
+
+### BarlowTwinsLoss
+
+Barlow Twins loss for self-supervised learning via cross-correlation matrix maximization.
+
+```python
+from monai.losses import BarlowTwinsLoss
+
+loss_fn = BarlowTwinsLoss(lambda_coeff=0.005)
+loss = loss_fn(z1, z2)
+```
+
+<ParamField path="lambda_coeff" type="float" default="5e-3">
+  Trade-off between invariance and redundancy reduction terms.
+</ParamField>
+
+---
+
+## Perceptual & image quality losses
+
+### PerceptualLoss
+
+Computes perceptual similarity using features from a pretrained network (2D or 3D).
+
+```python
+from monai.losses import PerceptualLoss
+
+loss_fn = PerceptualLoss(
+    spatial_dims=3,
+    network_type="radimagenet_resnet50",
+    is_fake_3d=True,
+)
+```
+
+<ParamField path="spatial_dims" type="int" required>
+  Number of spatial dimensions.
+</ParamField>
+
+<ParamField path="network_type" type="str" default="alex">
+  Backbone network: `"alex"`, `"vgg"`, `"squeeze"`, `"radimagenet_resnet50"`, `"medicalnet_resnet10"`.
+</ParamField>
+
+<ParamField path="is_fake_3d" type="bool" default="True">
+  If `True`, applies the 2D network to axial slices of 3D volumes.
+</ParamField>
+
+---
+
+### SSIMLoss
+
+Structural Similarity Index Measure (SSIM) loss for image reconstruction quality.
+
+```python
+from monai.losses import SSIMLoss
+
+loss_fn = SSIMLoss(spatial_dims=3, data_range=1.0)
+loss = loss_fn(prediction, target)
+```
+
+<ParamField path="spatial_dims" type="int" required>
+  Number of spatial dimensions.
+</ParamField>
+
+<ParamField path="data_range" type="float" default="1.0">
+  Value range of the input images.
+</ParamField>
+
+---
+
+## Registration losses
+
+### BendingEnergyLoss
+
+Regularization loss penalizing the bending energy of a deformation field. Used in deformable image registration.
+
+```python
+from monai.losses import BendingEnergyLoss
+
+reg_loss = BendingEnergyLoss()
+loss = reg_loss(deformation_field)
+```
+
+---
+
+### DiffusionLoss
+
+Diffusion regularization penalizing large spatial gradients in the deformation field.
+
+---
+
+## Other losses
+
+| Loss | Description |
+|------|-------------|
+| `MCCLoss` | Matthews Correlation Coefficient loss for binary segmentation |
+| `NACLLoss` | Neighborhood-aware contrastive learning loss |
+| `SURELoss` | Stein's Unbiased Risk Estimator for blind image restoration |
+| `JukeboxLoss` | Multi-scale spectral loss for audio/signal reconstruction |
+| `BoxGIoULoss` | Generalized IoU loss for bounding box regression |
+| `DeepSupervisionLoss` | Wraps any loss for use with deep supervision outputs |
+| `MaskedLoss` | Applies any loss function only within a spatial mask |
+| `GlobalMutualInformationLoss` | Global mutual information loss for registration |
+| `LocalNormalizedCrossCorrelationLoss` | Local NCC loss for deformable registration |

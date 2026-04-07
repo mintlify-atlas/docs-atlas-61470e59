@@ -1,0 +1,167 @@
+---
+title: "monai.optimizers"
+description: "Optimizers and learning rate utilities for MONAI training — including Novograd, learning rate finder, and schedulers."
+---
+
+The `monai.optimizers` module provides domain-tuned optimizers and learning rate utilities suited for medical imaging tasks.
+
+## Novograd
+
+`Novograd` is an adaptive learning rate optimizer well-suited for large-batch training and mixed-precision workflows. It uses the same learning rate for all parameters in a layer and maintains only first-moment statistics, reducing memory usage compared to Adam.
+
+```python
+from monai.optimizers import Novograd
+
+optimizer = Novograd(
+    model.parameters(),
+    lr=0.01,
+    betas=(0.95, 0.25),
+    weight_decay=0.001,
+)
+```
+
+<ParamField path="params" type="Iterable" required>
+  Model parameters to optimize.
+</ParamField>
+<ParamField path="lr" type="float" default="1e-3">
+  Learning rate.
+</ParamField>
+<ParamField path="betas" type="tuple[float, float]" default="(0.95, 0.98)">
+  Coefficients for computing running averages of gradient and its square.
+</ParamField>
+<ParamField path="eps" type="float" default="1e-8">
+  Term added to denominator for numerical stability.
+</ParamField>
+<ParamField path="weight_decay" type="float" default="0.0">
+  L2 weight decay coefficient.
+</ParamField>
+<ParamField path="grad_averaging" type="bool" default="False">
+  Apply gradient averaging (divide gradients by `1 - beta1`).
+</ParamField>
+<ParamField path="amsgrad" type="bool" default="False">
+  Use the AMSGrad variant.
+</ParamField>
+
+## LearningRateFinder
+
+Runs a learning rate range test to find the optimal initial learning rate. The test increases the LR exponentially over a number of iterations and records the loss.
+
+```python
+from monai.optimizers import LearningRateFinder
+
+lr_finder = LearningRateFinder(
+    model=model,
+    optimizer=optimizer,
+    criterion=loss_fn,
+    device="cuda",
+)
+lr_finder.range_test(train_loader, end_lr=10, num_iter=100)
+
+# Plot the loss vs LR curve (requires matplotlib)
+lr_finder.plot()
+
+# Reset model and optimizer to state before the test
+lr_finder.reset()
+```
+
+<ParamField path="model" type="nn.Module" required>
+  The model to test.
+</ParamField>
+<ParamField path="optimizer" type="Optimizer" required>
+  The optimizer to use during the range test.
+</ParamField>
+<ParamField path="criterion" type="Callable" required>
+  The loss function.
+</ParamField>
+<ParamField path="device" type="str | torch.device" default="cpu">
+  Device to run the test on.
+</ParamField>
+
+### `range_test` parameters
+
+<ParamField path="train_loader" type="DataLoader" required>
+  Training data loader.
+</ParamField>
+<ParamField path="end_lr" type="float" default="10">
+  Maximum learning rate to test.
+</ParamField>
+<ParamField path="num_iter" type="int" default="100">
+  Number of iterations to run the test over.
+</ParamField>
+<ParamField path="smooth_f" type="float" default="0.05">
+  Loss smoothing factor (exponential moving average).
+</ParamField>
+<ParamField path="diverge_th" type="float" default="5.0">
+  Stop the test if the loss exceeds `diverge_th * best_loss`.
+</ParamField>
+
+## Learning Rate Schedulers
+
+### WarmupCosineSchedule
+
+Linearly warms up the learning rate then decays via a cosine schedule.
+
+```python
+from monai.optimizers import WarmupCosineSchedule
+
+scheduler = WarmupCosineSchedule(
+    optimizer=optimizer,
+    warmup_steps=500,
+    t_total=10000,
+)
+
+# In training loop
+for step, batch in enumerate(train_loader):
+    ...
+    scheduler.step()
+```
+
+<ParamField path="warmup_steps" type="int" required>
+  Number of steps for the linear warmup phase.
+</ParamField>
+<ParamField path="t_total" type="int" required>
+  Total number of training steps.
+</ParamField>
+<ParamField path="cycles" type="float" default="0.5">
+  Number of cosine cycles in the decay phase.
+</ParamField>
+<ParamField path="last_epoch" type="int" default="-1">
+  Index of the last epoch.
+</ParamField>
+
+### LinearLR
+
+Linearly increases the learning rate from a low value to the optimizer's initial LR.
+
+```python
+from monai.optimizers import LinearLR
+
+scheduler = LinearLR(optimizer, end_lr=0.01, num_iter=100)
+```
+
+### ExponentialLR
+
+Exponentially increases the learning rate, useful for learning rate range tests.
+
+```python
+from monai.optimizers import ExponentialLR
+
+scheduler = ExponentialLR(optimizer, end_lr=10, num_iter=100)
+```
+
+## generate_param_groups
+
+Utility to create parameter groups with different learning rates (e.g., lower LR for a pretrained backbone):
+
+```python
+from monai.optimizers import generate_param_groups
+
+params = generate_param_groups(
+    network=model,
+    layer_matches=[lambda x: x.backbone],
+    match_types=["filter"],
+    lr_values=[1e-5],
+    include_others=True,
+)
+optimizer = torch.optim.Adam(params, lr=1e-4)
+```

@@ -1,0 +1,242 @@
+---
+title: 'MetaTensor'
+description: 'MetaTensor combines a PyTorch Tensor with a metadata dictionary, enabling affine-aware transforms, invertibility, and seamless integration with medical imaging pipelines.'
+---
+
+`MetaTensor` is MONAI's core data type for medical images. It subclasses both `torch.Tensor` and `MetaObj`, so it behaves exactly like a standard PyTorch tensor while also carrying a metadata dictionary that travels with the data through the entire pipeline.
+
+## What MetaTensor is
+
+A `MetaTensor` is a `torch.Tensor` with an attached `meta` dictionary. The most important metadata entry is `affine` — a 4×4 matrix that maps voxel indices to world-space coordinates in millimetres. This affine is what makes operations like `Spacing` and `Orientation` possible: they read the affine to compute the correct resampling parameters and write an updated affine to the output.
+
+```python
+import torch
+from monai.data import MetaTensor
+
+# Any standard torch operation returns a MetaTensor
+t = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+m = MetaTensor(t)
+
+print(type(m))           # <class 'monai.data.meta_tensor.MetaTensor'>
+print(isinstance(m, torch.Tensor))  # True
+print(m.shape)           # torch.Size([1, 2, 2])
+```
+
+## Creating MetaTensors
+
+<Tabs>
+  <Tab title="From a NumPy array">
+    ```python
+    import numpy as np
+    import torch
+    from monai.data import MetaTensor
+
+    array = np.random.rand(1, 64, 64, 64).astype(np.float32)
+
+    affine = torch.as_tensor([
+        [2.0, 0.0, 0.0, -63.0],
+        [0.0, 2.0, 0.0, -63.0],
+        [0.0, 0.0, 2.0, -63.0],
+        [0.0, 0.0, 0.0,   1.0],
+    ], dtype=torch.float64)
+
+    meta = {
+        "filename_or_obj": "patient_001.nii.gz",
+        "space": "RAS",
+    }
+
+    m = MetaTensor(array, affine=affine, meta=meta)
+    print(m.shape)    # torch.Size([1, 64, 64, 64])
+    print(m.affine)   # the 4x4 affine tensor
+    ```
+  </Tab>
+  <Tab title="From an existing tensor">
+    ```python
+    import torch
+    from monai.data import MetaTensor
+
+    t = torch.zeros(1, 128, 128, 64)
+    affine = torch.eye(4, dtype=torch.float64)
+    affine[0, 0] = 0.8   # 0.8mm x-spacing
+    affine[1, 1] = 0.8   # 0.8mm y-spacing
+    affine[2, 2] = 3.0   # 3.0mm z-spacing
+
+    m = MetaTensor(t, affine=affine)
+    ```
+  </Tab>
+  <Tab title="Via LoadImaged">
+    ```python
+    from monai.transforms import LoadImaged, EnsureChannelFirstd, Compose
+
+    load = Compose([
+        LoadImaged(keys=["image"]),
+        EnsureChannelFirstd(keys=["image"]),
+    ])
+
+    sample = load({"image": "patient_001.nii.gz"})
+    m = sample["image"]   # already a MetaTensor
+
+    print(type(m))        # <class 'monai.data.meta_tensor.MetaTensor'>
+    print(m.meta.keys())  # includes 'affine', 'space', 'filename_or_obj', etc.
+    ```
+  </Tab>
+</Tabs>
+
+## Accessing metadata
+
+The `.meta` property returns the full metadata dictionary. The most commonly accessed fields are:
+
+```python
+from monai.data import MetaTensor
+import torch
+
+m = MetaTensor(torch.zeros(1, 64, 64, 32))
+m.affine = torch.diag(torch.tensor([1.5, 1.5, 2.0, 1.0], dtype=torch.float64))
+
+# Access the affine matrix
+print(m.affine)
+# tensor([[1.5, 0.0, 0.0, 0.0],
+#         [0.0, 1.5, 0.0, 0.0],
+#         [0.0, 0.0, 2.0, 0.0],
+#         [0.0, 0.0, 0.0, 1.0]], dtype=torch.float64)
+
+# Access voxel spacing (derived from the affine diagonal)
+print(m.pixdim)
+# tensor([1.5, 1.5, 2.0])
+
+# Access arbitrary metadata fields
+print(m.meta.get("space", "RAS"))        # coordinate space
+print(m.meta.get("filename_or_obj"))     # source file path
+
+# The applied_operations list records every transform that was applied
+print(m.applied_operations)
+```
+
+The default affine is `torch.eye(4, dtype=torch.float64)` (identity, 1mm isotropic).
+
+## How transforms propagate metadata
+
+Every MONAI transform that modifies spatial dimensions updates the affine accordingly. You never have to manage this manually.
+
+```python
+from monai.transforms import Spacingd, Orientationd, Compose, LoadImaged, EnsureChannelFirstd
+
+pipeline = Compose([
+    LoadImaged(keys=["image"]),
+    EnsureChannelFirstd(keys=["image"]),
+    Orientationd(keys=["image"], axcodes="RAS"),
+    Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode="bilinear"),
+])
+
+result = pipeline({"image": "scan.nii.gz"})
+img = result["image"]
+
+# The affine reflects the new 1mm isotropic spacing
+print(img.pixdim)       # tensor([1., 1., 1.])
+print(img.affine)       # updated 4x4 matrix
+print(len(img.applied_operations))  # 2 (Orientation + Spacing recorded)
+```
+
+Random spatial transforms such as `RandAffine` also update the affine, which is what makes inversion possible.
+
+## Converting to and from plain tensors
+
+`MetaTensor` is fully interoperable with standard `torch.Tensor`. Most PyTorch operations return a `MetaTensor` automatically, propagating metadata from the input.
+
+```python
+import torch
+from monai.data import MetaTensor
+
+m = MetaTensor(torch.rand(1, 64, 64, 64))
+
+# Convert to plain torch.Tensor (drops metadata)
+plain = m.as_tensor()
+print(type(plain))   # <class 'torch.Tensor'>
+
+# Convert to numpy array (shares storage on CPU)
+array = m.array
+print(type(array))   # <class 'numpy.ndarray'>
+
+# Standard torch operations preserve MetaTensor type
+m2 = m * 2.0
+print(type(m2))      # <class 'monai.data.meta_tensor.MetaTensor'>
+print(m2.meta)       # metadata copied from m
+
+# Explicit cast back
+m3 = MetaTensor(plain, meta=m.meta.copy())
+```
+
+To disable metadata tracking globally (e.g., for inference performance profiling):
+
+```python
+from monai.data import set_track_meta
+
+set_track_meta(False)   # transforms return plain torch.Tensor
+# ... your code ...
+set_track_meta(True)    # restore default
+```
+
+## MetaObj base class
+
+`MetaTensor` inherits from `MetaObj`, the abstract base class that defines the metadata contract. `MetaObj` provides:
+
+- `meta`: the metadata dictionary
+- `applied_operations`: list of recorded transform operations (used for inversion)
+- `pending_operations`: transforms queued for lazy execution
+- `is_batch`: whether this object represents a collated batch
+- `copy_meta_from()`: copy metadata from another `MetaObj`
+
+```python
+from monai.data.meta_obj import MetaObj, get_track_meta, set_track_meta
+
+print(get_track_meta())   # True (default)
+```
+
+This design allows `MetaTensor` to participate in PyTorch's `__torch_function__` protocol, so metadata propagation happens automatically through standard tensor operations like `torch.cat`, `torch.stack`, and arithmetic.
+
+## Why this matters
+
+<CardGroup cols={2}>
+  <Card title="Affine-aware transforms" icon="ruler-combined" href="/concepts/transforms">
+    Transforms like `Spacing`, `Orientation`, and `RandAffine` read and update the affine matrix to produce geometrically correct results without any manual bookkeeping.
+  </Card>
+  <Card title="Invertible preprocessing" icon="rotate-left" href="/concepts/transforms">
+    The `applied_operations` log lets `Invertd` map model predictions back to the original patient image space, including reversing random augmentations.
+  </Card>
+  <Card title="Seamless batching" icon="layer-group" href="/concepts/datasets-and-dataloading">
+    MONAI's `DataLoader` collates `MetaTensor` objects correctly, merging per-sample metadata into batched form and splitting it back on decollation.
+  </Card>
+  <Card title="ITK/NiBabel interoperability" icon="arrows-left-right" href="/concepts/datasets-and-dataloading">
+    Utilities like `itk_image_to_metatensor` and `metatensor_to_itk_image` convert between MetaTensor and ITK image objects, preserving the affine and spacing.
+  </Card>
+</CardGroup>
+
+## Working with batched MetaTensors
+
+When a `DataLoader` collates a batch of `MetaTensor` objects, the result is a single `MetaTensor` with `is_batch=True`. Indexing the batch dimension splits the metadata correctly:
+
+```python
+from monai.data import DataLoader, CacheDataset
+
+loader = DataLoader(dataset, batch_size=4, num_workers=2)
+
+for batch in loader:
+    images = batch["image"]        # MetaTensor, is_batch=True
+    print(images.is_batch)         # True
+    print(images.affine.shape)     # (4, 4, 4) — one affine per sample
+
+    # Index a single sample
+    first = images[0]
+    print(first.is_batch)          # False
+    print(first.affine.shape)      # (4, 4)
+```
+
+After inference, use `decollate_batch` to split the batch back into a list of individual `MetaTensor` objects for post-processing:
+
+```python
+from monai.data import decollate_batch
+
+outputs = model(images)   # (B, C, H, W, D)
+output_list = decollate_batch(outputs)
+# output_list is a list of B individual MetaTensors
+```

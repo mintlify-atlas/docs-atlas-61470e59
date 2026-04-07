@@ -1,0 +1,413 @@
+---
+title: Segmentation
+description: 3D medical image segmentation with MONAI — networks, losses, metrics, transforms, and an end-to-end spleen segmentation example.
+---
+
+Medical image segmentation is the core use-case MONAI was built around. The framework provides encoder–decoder architectures optimised for 3D volumetric data, task-specific losses and metrics, a rich transform library, and managed benchmark datasets so you can go from raw CT/MRI scans to a trained model with minimal boilerplate.
+
+<CardGroup cols={2}>
+  <Card title="Networks" icon="network-wired">
+    UNet, SwinUNETR, SegResNet, DynUNet, UNETR — all supporting 2-D and 3-D inputs
+  </Card>
+  <Card title="Losses" icon="chart-line">
+    DiceCELoss and GeneralizedDiceLoss for class-imbalanced volumetric segmentation
+  </Card>
+  <Card title="Metrics" icon="ruler">
+    DiceMetric and HausdorffDistanceMetric with batched, multi-class support
+  </Card>
+  <Card title="Datasets" icon="database">
+    DecathlonDataset with automatic download, caching, and train/val splits
+  </Card>
+</CardGroup>
+
+---
+
+## Recommended networks
+
+### UNet
+
+A residual UNet with configurable depth, strides, and channel widths. Strided convolutions are used for downsampling and strided transposed convolutions for upsampling so the encoder and decoder are symmetric by construction.
+
+```python
+from monai.networks.nets import UNet
+
+model = UNet(
+    spatial_dims=3,       # 2 for 2-D images, 3 for volumetric
+    in_channels=1,        # e.g. single-channel CT
+    out_channels=2,       # background + foreground
+    channels=(16, 32, 64, 128, 256),
+    strides=(2, 2, 2, 2),
+    num_res_units=2,      # residual units per block
+    norm="instance",
+)
+```
+
+<Tip>
+Increase `num_res_units` to 2 or higher to add residual skip connections inside each encoder/decoder block — this can noticeably improve convergence on small datasets.
+</Tip>
+
+### SwinUNETR
+
+A hybrid Swin Transformer + UNet architecture. The Swin Transformer backbone captures long-range dependencies through shifted-window self-attention, while the convolutional decoder restores spatial resolution.
+
+```python
+from monai.networks.nets import SwinUNETR
+
+model = SwinUNETR(
+    in_channels=1,
+    out_channels=14,              # e.g. 14-organ segmentation
+    feature_size=48,              # base channel width
+    depths=(2, 2, 2, 2),         # transformer depth per stage
+    num_heads=(3, 6, 12, 24),    # attention heads per stage
+    window_size=7,
+    spatial_dims=3,
+    use_checkpoint=True,          # gradient checkpointing for large volumes
+)
+```
+
+### SegResNet
+
+```python
+from monai.networks.nets import SegResNet
+
+model = SegResNet(
+    spatial_dims=3,
+    in_channels=4,   # e.g. BraTS multi-modal MRI
+    out_channels=3,
+    init_filters=32,
+)
+```
+
+### DynUNet
+
+A dynamic UNet whose kernel sizes and strides can be computed automatically from the median spacing of the training set — mimicking the nnU-Net heuristic.
+
+```python
+from monai.networks.nets import DynUNet
+
+model = DynUNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=2,
+    kernel_size=[[3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3]],
+    strides=[[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2]],
+    upsample_kernel_size=[[2, 2, 2], [2, 2, 2], [2, 2, 2]],
+)
+```
+
+### UNETR
+
+A pure Vision Transformer encoder with a convolutional decoder. Patches of the 3-D volume are embedded and processed by the transformer, then progressively upsampled.
+
+```python
+from monai.networks.nets import UNETR
+
+model = UNETR(
+    in_channels=1,
+    out_channels=14,
+    img_size=(96, 96, 96),
+    feature_size=16,
+    hidden_size=768,
+    mlp_dim=3072,
+    num_heads=12,
+    spatial_dims=3,
+)
+```
+
+---
+
+## Losses
+
+<Tabs>
+  <Tab title="DiceCELoss">
+    Combines soft Dice loss and cross-entropy in a single call. The Dice term handles class imbalance; the cross-entropy term stabilises early training.
+
+    ```python
+    from monai.losses import DiceCELoss
+
+    loss_fn = DiceCELoss(
+        include_background=False,
+        to_onehot_y=True,       # converts integer label map to one-hot
+        softmax=True,
+        lambda_dice=1.0,
+        lambda_ce=1.0,
+    )
+
+    loss = loss_fn(pred_logits, labels)  # labels: (B, 1, H, W, D)
+    ```
+  </Tab>
+  <Tab title="GeneralizedDiceLoss">
+    Weights each class by the inverse of its label frequency, making it more robust to extreme class imbalance.
+
+    ```python
+    from monai.losses import GeneralizedDiceLoss
+
+    loss_fn = GeneralizedDiceLoss(
+        include_background=False,
+        to_onehot_y=True,
+        softmax=True,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Metrics
+
+```python
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
+from monai.transforms import AsDiscrete
+
+# Build metric objects
+dice_metric = DiceMetric(include_background=False, reduction="mean")
+hd_metric   = HausdorffDistanceMetric(include_background=False, percentile=95)
+
+post_pred  = AsDiscrete(argmax=True, to_onehot=num_classes)
+post_label = AsDiscrete(to_onehot=num_classes)
+
+# Inside validation loop
+dice_metric(y_pred=[post_pred(p) for p in outputs],
+            y=[post_label(l) for l in labels])
+
+mean_dice = dice_metric.aggregate().item()
+dice_metric.reset()
+```
+
+<Note>
+`HausdorffDistanceMetric` with `percentile=95` computes the 95th-percentile Hausdorff distance, which is far less sensitive to outliers than the full HD and is the standard metric for most medical image segmentation challenges.
+</Note>
+
+---
+
+## Standard transforms pipeline
+
+The following pipeline covers the typical preprocessing and data augmentation steps for 3-D segmentation with dictionary-style transforms.
+
+```python
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    ScaleIntensityRanged,
+    RandCropByPosNegLabeld,
+    RandFlipd,
+    RandRotate90d,
+)
+
+train_transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=-57,   # lower HU window for spleen
+        a_max=164,   # upper HU window for spleen
+        b_min=0.0,
+        b_max=1.0,
+        clip=True,
+    ),
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=(96, 96, 96),
+        pos=1,
+        neg=1,
+        num_samples=4,   # crops per volume per epoch
+        image_key="image",
+        image_threshold=0,
+    ),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandRotate90d(keys=["image", "label"], prob=0.1, max_k=3),
+])
+```
+
+| Transform | Purpose |
+|---|---|
+| `LoadImaged` | Reads NIfTI / DICOM / MetaImage files |
+| `EnsureChannelFirstd` | Adds a channel dimension: `(H, W, D)` → `(C, H, W, D)` |
+| `ScaleIntensityRanged` | Clips and normalises HU values to `[0, 1]` |
+| `RandCropByPosNegLabeld` | Balanced foreground/background random crops |
+| `RandFlipd` | Random mirror flips along a spatial axis |
+| `RandRotate90d` | Random 90° rotations |
+
+---
+
+## DecathlonDataset
+
+`DecathlonDataset` from `monai.apps` downloads and caches any of the ten Medical Segmentation Decathlon tasks.
+
+```python
+from monai.apps import DecathlonDataset
+from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd
+
+train_ds = DecathlonDataset(
+    root_dir="/data/decathlon",
+    task="Task09_Spleen",        # see list of tasks below
+    section="training",
+    transform=train_transforms,
+    download=True,               # skipped if data already exists
+    cache_rate=1.0,              # cache entire dataset in RAM
+    num_workers=4,
+)
+```
+
+<Accordion title="Available Decathlon tasks">
+
+| Task ID | Organ/Pathology |
+|---|---|
+| `Task01_BrainTumour` | Brain tumour (multi-modal MRI) |
+| `Task02_Heart` | Heart left atrium (MRI) |
+| `Task03_Liver` | Liver + tumour (CT) |
+| `Task04_Hippocampus` | Hippocampus (MRI) |
+| `Task05_Prostate` | Prostate zones (MRI) |
+| `Task06_Lung` | Lung tumour (CT) |
+| `Task07_Pancreas` | Pancreas + tumour (CT) |
+| `Task08_HepaticVessel` | Hepatic vessels + tumour (CT) |
+| `Task09_Spleen` | Spleen (CT) |
+| `Task10_Colon` | Colon cancer (CT) |
+
+</Accordion>
+
+---
+
+## Sliding window inference
+
+For volumetric inputs that are larger than the ROI size used during training, use `SlidingWindowInferer` to tile the volume at test time.
+
+```python
+from monai.inferers import SlidingWindowInferer
+
+inferer = SlidingWindowInferer(
+    roi_size=(96, 96, 96),
+    sw_batch_size=4,        # windows processed in parallel
+    overlap=0.5,            # 50 % overlap reduces boundary artefacts
+    mode="gaussian",        # Gaussian blend weights at window edges
+)
+
+model.eval()
+with torch.no_grad():
+    output = inferer(inputs, model)
+```
+
+<Tip>
+Increase `overlap` from `0.25` to `0.5` to reduce boundary stitching artefacts at the cost of ~3× more compute. For memory-constrained GPUs, reduce `sw_batch_size` to 1.
+</Tip>
+
+---
+
+## End-to-end example: spleen segmentation
+
+<Steps>
+  <Step title="Prepare the dataset">
+    ```python
+    from monai.apps import DecathlonDataset
+
+    train_ds = DecathlonDataset(
+        root_dir="./data",
+        task="Task09_Spleen",
+        section="training",
+        transform=train_transforms,
+        download=True,
+        cache_rate=1.0,
+        num_workers=4,
+    )
+    val_ds = DecathlonDataset(
+        root_dir="./data",
+        task="Task09_Spleen",
+        section="validation",
+        transform=val_transforms,
+        download=False,
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=4)
+    val_loader   = DataLoader(val_ds,   batch_size=1, num_workers=4)
+    ```
+  </Step>
+
+  <Step title="Build model, loss, and optimiser">
+    ```python
+    import torch
+    from monai.networks.nets import UNet
+    from monai.losses import DiceCELoss
+    from monai.metrics import DiceMetric
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = UNet(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=2,
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,
+    ).to(device)
+
+    loss_fn     = DiceCELoss(to_onehot_y=True, softmax=True)
+    optimizer   = torch.optim.Adam(model.parameters(), 1e-4)
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    scaler      = torch.cuda.amp.GradScaler()   # automatic mixed precision
+    ```
+  </Step>
+
+  <Step title="Training loop">
+    ```python
+    from torch.cuda.amp import autocast
+
+    for epoch in range(max_epochs):
+        model.train()
+        for batch in train_loader:
+            images, labels = batch["image"].to(device), batch["label"].to(device)
+            optimizer.zero_grad()
+
+            with autocast():
+                outputs = model(images)
+                loss = loss_fn(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+    ```
+  </Step>
+
+  <Step title="Validation with sliding window inference">
+    ```python
+    from monai.inferers import SlidingWindowInferer
+    from monai.transforms import AsDiscrete
+
+    inferer    = SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4, overlap=0.5)
+    post_pred  = AsDiscrete(argmax=True, to_onehot=2)
+    post_label = AsDiscrete(to_onehot=2)
+
+    model.eval()
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+            outputs = inferer(images, model)
+            dice_metric(
+                y_pred=[post_pred(o) for o in outputs],
+                y=[post_label(l) for l in labels],
+            )
+
+    mean_dice = dice_metric.aggregate().item()
+    dice_metric.reset()
+    print(f"Validation Dice: {mean_dice:.4f}")
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Performance tips
+
+<CardGroup cols={3}>
+  <Card title="CacheDataset" icon="bolt">
+    Wrap your dataset with `CacheDataset` (or use `DecathlonDataset`'s `cache_rate=1.0`) to pre-compute and cache deterministic transforms in RAM — this can cut epoch time by 10×.
+  </Card>
+  <Card title="Automatic Mixed Precision" icon="microchip">
+    Use `torch.cuda.amp.autocast` and `GradScaler` for AMP training. AMP roughly halves GPU memory usage and speeds up training on Ampere+ GPUs with no loss in accuracy.
+  </Card>
+  <Card title="ROI size tuning" icon="sliders">
+    A larger ROI size captures more spatial context but increases memory. Common choices are `(96, 96, 96)` for whole-body CT and `(128, 128, 128)` for high-resolution single-organ tasks.
+  </Card>
+</CardGroup>

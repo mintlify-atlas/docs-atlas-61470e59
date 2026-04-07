@@ -1,0 +1,424 @@
+---
+title: Generation
+description: Medical image synthesis with MONAI — diffusion models, variational autoencoders, ControlNet, SPADE networks, and latent diffusion.
+---
+
+MONAI's generation module provides building blocks for medical image synthesis and data augmentation. The primary architectures are denoising diffusion probabilistic models (DDPMs) with a U-Net backbone, variational autoencoders (VAE/VQ-VAE) for learning compact latent spaces, and latent diffusion models (LDMs) that combine both.
+
+<CardGroup cols={2}>
+  <Card title="Diffusion Models" icon="wand-magic-sparkles">
+    DiffusionModelUNet + DiffusionInferer with configurable noise schedulers
+  </Card>
+  <Card title="Autoencoders" icon="compress">
+    AutoencoderKL and VQVAE for learning compact, structured latent spaces
+  </Card>
+  <Card title="Latent Diffusion" icon="layer-group">
+    LatentDiffusionInferer combines a VAE first stage with a diffusion second stage
+  </Card>
+  <Card title="SPADE / ControlNet" icon="sliders">
+    Semantic conditioning with SPADE normalisation and ControlNet adapters
+  </Card>
+</CardGroup>
+
+---
+
+## Diffusion models
+
+### DiffusionModelUNet
+
+A U-Net with timestep embedding and optional cross-attention conditioning, based on the Latent Diffusion and BrainSuite papers.
+
+```python
+from monai.networks.nets import DiffusionModelUNet
+
+model = DiffusionModelUNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=1,
+    num_res_blocks=(2, 2, 2, 2),           # residual blocks per level
+    channels=(32, 64, 64, 64),             # output channels per level
+    attention_levels=(False, False, True, True),
+    norm_num_groups=32,
+    norm_eps=1e-6,
+    resblock_updown=False,
+    num_head_channels=8,
+    with_conditioning=False,               # set True for cross-attention conditioning
+    # cross_attention_dim=512,             # required when with_conditioning=True
+    use_flash_attention=False,
+)
+```
+
+<Accordion title="Constructor parameters">
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `spatial_dims` | `int` | — | Number of spatial dimensions (2 or 3) |
+| `in_channels` | `int` | — | Input channels |
+| `out_channels` | `int` | — | Output channels |
+| `num_res_blocks` | `int \| Sequence[int]` | `(2,2,2,2)` | Residual blocks per encoder/decoder level |
+| `channels` | `Sequence[int]` | `(32,64,64,64)` | Feature channels per level |
+| `attention_levels` | `Sequence[bool]` | `(F,F,T,T)` | Which levels get self-attention |
+| `norm_num_groups` | `int` | `32` | Groups for GroupNorm; all channels must be divisible by this |
+| `with_conditioning` | `bool` | `False` | Enable cross-attention conditioning |
+| `cross_attention_dim` | `int \| None` | `None` | Context embedding size (required when `with_conditioning=True`) |
+| `num_class_embeds` | `int \| None` | `None` | Number of discrete class labels for class conditioning |
+| `use_flash_attention` | `bool` | `False` | Use PyTorch built-in flash attention |
+
+</Accordion>
+
+### DiffusionInferer
+
+Handles forward (training) and reverse (sampling) diffusion using any scheduler from `monai.networks.schedulers`.
+
+```python
+from monai.inferers import DiffusionInferer
+from monai.networks.schedulers import DDPMScheduler
+
+scheduler = DDPMScheduler(num_train_timesteps=1000)
+inferer   = DiffusionInferer(scheduler)
+```
+
+#### Training loop
+
+```python
+import torch
+
+model.train()
+for batch in train_loader:
+    images = batch["image"].to(device)              # (B, C, H, W, D)
+
+    # Sample random timesteps and noise
+    timesteps = torch.randint(
+        0, scheduler.num_train_timesteps,
+        (images.shape[0],), device=device
+    ).long()
+    noise = torch.randn_like(images)
+
+    # Forward pass: predict the noise added at these timesteps
+    noise_pred = inferer(
+        inputs=images,
+        diffusion_model=model,
+        noise=noise,
+        timesteps=timesteps,
+    )
+
+    loss = torch.nn.functional.mse_loss(noise_pred, noise)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+#### Inference (reverse diffusion)
+
+```python
+from monai.networks.schedulers import DDPMScheduler
+
+scheduler.set_timesteps(num_inference_steps=1000)
+
+model.eval()
+with torch.no_grad():
+    # Start from pure noise
+    noise = torch.randn(1, 1, 64, 64, 64, device=device)
+
+    synth_image, intermediates = inferer.sample(
+        input_noise=noise,
+        diffusion_model=model,
+        scheduler=scheduler,
+        save_intermediates=True,
+        intermediate_steps=100,
+        verbose=True,
+    )
+```
+
+---
+
+## Variational Autoencoders
+
+### AutoencoderKL
+
+A KL-regularised VAE based on the Latent Diffusion paper. It learns a Gaussian latent space and is the recommended first stage for `LatentDiffusionInferer`.
+
+```python
+from monai.networks.nets import AutoencoderKL
+
+vae = AutoencoderKL(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=1,
+    num_res_blocks=(2, 2, 2, 2),
+    channels=(32, 64, 64, 64),
+    attention_levels=(False, False, True, True),
+    latent_channels=3,              # latent space dimensionality
+    norm_num_groups=32,
+    with_encoder_nonlocal_attn=True,
+    with_decoder_nonlocal_attn=True,
+)
+```
+
+**Encoding / decoding:**
+
+```python
+# Encode to latent space
+z_mu, z_sigma = vae.encode(image)
+z = vae.sampling(z_mu, z_sigma)    # reparameterisation trick
+
+# Decode from latent
+reconstruction = vae.decode(z)
+
+# Stage-2 helpers (used by LatentDiffusionInferer)
+latent = vae.encode_stage_2_inputs(image)
+decoded = vae.decode_stage_2_outputs(latent)
+```
+
+### VQVAE
+
+A Vector-Quantised VAE with a discrete codebook. Useful when you need a finite discrete latent space (e.g. for autoregressive generation).
+
+```python
+from monai.networks.nets import VQVAE
+
+vqvae = VQVAE(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=1,
+    channels=(96, 96, 192),
+    num_res_layers=3,
+    num_res_channels=(96, 96, 192),
+    downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1)),
+    upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
+    num_embeddings=32,
+    embedding_dim=64,
+    commitment_cost=0.25,
+)
+
+reconstruction, quantization_loss = vqvae(image)
+```
+
+---
+
+## ControlNet for conditioned generation
+
+`ControlNet` adds spatial conditioning signals (e.g. segmentation masks, edge maps) to a pre-trained diffusion model without fine-tuning the backbone.
+
+```python
+from monai.apps.generation.maisi.networks.controlnet_maisi import ControlNetMaisi
+
+controlnet = ControlNetMaisi(
+    spatial_dims=3,
+    in_channels=1,
+    num_res_blocks=2,
+    channels=(32, 64, 64, 64),
+    attention_levels=(False, False, True, True),
+    norm_num_groups=32,
+    conditioning_embedding_num_channels=(32,),
+)
+
+# Forward pass with conditioning signal
+down_block_res_samples, mid_block_res_sample = controlnet(
+    x=noisy_image,
+    timesteps=timesteps,
+    controlnet_cond=segmentation_mask,   # the conditioning signal
+)
+```
+
+---
+
+## SPADE networks
+
+SPADE (Spatially-Adaptive Denormalization) normalisation replaces the learnable affine parameters of instance normalisation with parameters predicted from a semantic segmentation map. This enables semantic image synthesis where the output respects the spatial layout of the input mask.
+
+### SPADEAutoencoderKL
+
+```python
+from monai.networks.nets import SPADEAutoencoderKL
+
+spade_vae = SPADEAutoencoderKL(
+    spatial_dims=2,
+    label_nc=5,              # number of semantic channels
+    in_channels=1,
+    out_channels=1,
+    num_res_blocks=(2, 2, 2, 2),
+    channels=(32, 64, 64, 64),
+    attention_levels=(False, False, True, True),
+    latent_channels=3,
+    spade_intermediate_channels=128,
+)
+
+reconstruction, z_mu, z_sigma = spade_vae(image, seg=segmentation_map)
+```
+
+### SPADEDiffusionModelUNet
+
+```python
+from monai.networks.nets import SPADEDiffusionModelUNet
+
+spade_unet = SPADEDiffusionModelUNet(
+    spatial_dims=2,
+    label_nc=5,
+    in_channels=1,
+    out_channels=1,
+    channels=(32, 64, 64, 64),
+    attention_levels=(False, False, True, True),
+    norm_num_groups=32,
+)
+```
+
+---
+
+## LatentDiffusionInferer
+
+Combines a VAE (or VQVAE) first stage with a `DiffusionModelUNet` second stage. The VAE compresses images to a lower-resolution latent space; the diffusion model learns to denoise in that space.
+
+```python
+from monai.inferers import LatentDiffusionInferer
+from monai.networks.schedulers import DDPMScheduler
+
+scheduler = DDPMScheduler(num_train_timesteps=1000)
+
+ldm_inferer = LatentDiffusionInferer(
+    scheduler=scheduler,
+    scale_factor=1.0,   # multiply latents before passing to diffusion model
+)
+```
+
+**Training:**
+
+```python
+noise_pred = ldm_inferer(
+    inputs=images,
+    autoencoder_model=vae,        # AutoencoderKL or VQVAE
+    diffusion_model=model,
+    noise=noise,
+    timesteps=timesteps,
+)
+loss = torch.nn.functional.mse_loss(noise_pred, noise)
+```
+
+**Sampling:**
+
+```python
+with torch.no_grad():
+    latent_noise = torch.randn(1, 3, 8, 8, 8, device=device)
+    synthetic_latent, _ = ldm_inferer.sample(
+        input_noise=latent_noise,
+        autoencoder_model=vae,
+        diffusion_model=model,
+        scheduler=scheduler,
+        save_intermediates=False,
+    )
+    # decode from latent space
+    synthetic_image = vae.decode_stage_2_outputs(synthetic_latent / scale_factor)
+```
+
+---
+
+## Generation losses
+
+```python
+from monai.losses import PerceptualLoss, SSIMLoss
+
+# Perceptual loss (requires a pre-trained feature network)
+perc_loss = PerceptualLoss(
+    spatial_dims=3,
+    network_type="squeeze",    # "alex", "vgg", or "squeeze"
+    is_fake_3d=True,           # use 2D slices for 3D volumes
+    fake_3d_ratio=0.1,
+)
+loss = perc_loss(reconstruction, target)
+
+# SSIM loss
+ssim_loss = SSIMLoss(spatial_dims=3, data_range=1.0)
+loss = ssim_loss(reconstruction, target)
+```
+
+<Note>
+For VAE training, the total loss is typically a combination of reconstruction loss (L1 or MSE), KL divergence, and perceptual loss:
+
+```python
+kl_loss    = 0.5 * torch.sum(z_mu**2 + z_sigma**2 - torch.log(z_sigma**2) - 1)
+recon_loss = torch.nn.functional.l1_loss(reconstruction, image)
+total_loss = recon_loss + 1e-6 * kl_loss + 0.001 * perc_loss(reconstruction, image)
+```
+</Note>
+
+---
+
+## Code example: simple diffusion model training
+
+<Steps>
+  <Step title="Instantiate model and scheduler">
+    ```python
+    import torch
+    from monai.networks.nets import DiffusionModelUNet
+    from monai.networks.schedulers import DDPMScheduler
+    from monai.inferers import DiffusionInferer
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = DiffusionModelUNet(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=1,
+        channels=(32, 64, 64, 64),
+        attention_levels=(False, False, True, True),
+        num_res_blocks=2,
+        norm_num_groups=32,
+    ).to(device)
+
+    scheduler = DDPMScheduler(num_train_timesteps=1000)
+    inferer   = DiffusionInferer(scheduler)
+    optimizer = torch.optim.Adam(model.parameters(), lr=2.5e-5)
+    ```
+  </Step>
+
+  <Step title="Training loop">
+    ```python
+    from torch.cuda.amp import autocast, GradScaler
+
+    scaler = GradScaler()
+
+    model.train()
+    for epoch in range(num_epochs):
+        for batch in train_loader:
+            images = batch["image"].to(device)
+            noise  = torch.randn_like(images)
+            timesteps = torch.randint(
+                0, scheduler.num_train_timesteps,
+                (images.shape[0],), device=device
+            ).long()
+
+            optimizer.zero_grad()
+            with autocast():
+                noise_pred = inferer(
+                    inputs=images,
+                    diffusion_model=model,
+                    noise=noise,
+                    timesteps=timesteps,
+                )
+                loss = torch.nn.functional.mse_loss(noise_pred, noise)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+    ```
+  </Step>
+
+  <Step title="Sample new images">
+    ```python
+    scheduler.set_timesteps(num_inference_steps=1000)
+
+    model.eval()
+    with torch.no_grad():
+        noise = torch.randn(1, 1, 64, 64, 64, device=device)
+        synthetic = inferer.sample(
+            input_noise=noise,
+            diffusion_model=model,
+            scheduler=scheduler,
+        )
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+For large 3-D volumes, latent diffusion (VAE + diffusion in latent space) is far more memory efficient than pixel-space diffusion. Train the VAE first, freeze it, then train the `DiffusionModelUNet` on encoded latents using `LatentDiffusionInferer`.
+</Tip>

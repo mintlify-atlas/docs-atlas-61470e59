@@ -1,97 +1,111 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "MONAI — Medical Open Network for AI"
+description: "A PyTorch-based open-source framework for deep learning in healthcare imaging. Build, train, and deploy state-of-the-art medical image analysis models."
 ---
 
-## Setting up
+MONAI is the go-to PyTorch framework for medical image analysis. It provides domain-specific building blocks — transforms, datasets, network architectures, loss functions, and evaluation metrics — purpose-built for healthcare imaging research and clinical applications.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install MONAI via pip, conda, or Docker in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Train your first medical image segmentation model
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="book" href="/concepts/transforms">
+    Understand transforms, MetaTensor, datasets, and networks
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/transforms">
+    Explore the full Python API across all modules
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why MONAI?
 
-Everything you need to create world-class documentation.
+MONAI accelerates medical imaging research by providing production-ready components that integrate seamlessly with existing PyTorch workflows.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="200+ Transforms" icon="wand-magic-sparkles" href="/concepts/transforms">
+    Medical-grade image transforms for spatial, intensity, and I/O operations — in both array and dictionary styles
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="50+ Networks" icon="network-wired" href="/concepts/networks-and-losses">
+    Reference implementations of UNet, SwinUNETR, SegResNet, ViT, DiffusionModelUNet, and more
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="MONAI Bundle" icon="box-archive" href="/guides/bundle">
+    Package and share models with structured JSON configs for training, inference, and deployment
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Auto3DSeg" icon="robot" href="/guides/auto3dseg">
+    Automated end-to-end 3D segmentation with state-of-the-art performance
   </Card>
-</Columns>
+  <Card title="Federated Learning" icon="share-nodes" href="/guides/federated-learning">
+    Privacy-preserving distributed training via MonaiAlgo and NVIDIA FLARE integration
+  </Card>
+  <Card title="GPU Acceleration" icon="bolt" href="/guides/acceleration">
+    AMP, CacheDataset, distributed training, and C++/CUDA extensions for maximum throughput
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+## Get started in 4 steps
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install MONAI">
+    Install the framework with your preferred package manager:
+    ```bash
+    pip install monai
+    ```
+  </Step>
+  <Step title="Load and transform medical images">
+    Use MONAI's domain-specific transforms to load and preprocess medical images:
+    ```python
+    from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityRanged
+
+    transforms = Compose([
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
+    ])
+    ```
+  </Step>
+  <Step title="Build a network and loss function">
+    Pick from MONAI's library of medical imaging architectures:
+    ```python
+    from monai.networks.nets import UNet
+    from monai.losses import DiceCELoss
+
+    model = UNet(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=2,
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+    )
+    loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
+    ```
+  </Step>
+  <Step title="Run sliding window inference">
+    Efficiently infer on large 3D volumes:
+    ```python
+    from monai.inferers import SlidingWindowInferer
+
+    inferer = SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4, overlap=0.5)
+    outputs = inferer(inputs, model)
+    ```
+  </Step>
+</Steps>
+
+## Explore by task
+
+<CardGroup cols={2}>
+  <Card title="3D Segmentation" icon="cube" href="/apps/segmentation">
+    Segment organs, lesions, and anatomical structures in volumetric CT and MRI data
+  </Card>
+  <Card title="Object Detection" icon="magnifying-glass" href="/apps/detection">
+    Detect and localize lesions and landmarks in medical images
+  </Card>
+  <Card title="Generative AI" icon="image" href="/apps/generation">
+    Synthesize medical images with diffusion models and VAEs
+  </Card>
+  <Card title="Computational Pathology" icon="microscope" href="/apps/pathology">
+    Analyze whole slide images for digital pathology workflows
+  </Card>
+</CardGroup>

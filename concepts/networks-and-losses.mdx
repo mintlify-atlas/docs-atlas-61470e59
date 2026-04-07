@@ -1,0 +1,452 @@
+---
+title: 'Networks and losses'
+description: 'Reference architectures and loss functions for medical image segmentation, classification, and reconstruction, all supporting 1D/2D/3D inputs.'
+---
+
+MONAI implements a comprehensive set of network architectures and loss functions purpose-built for medical imaging tasks. All networks support spatial 1D, 2D, and 3D inputs via the `spatial_dims` parameter, and all components integrate with PyTorch's standard training loop.
+
+## Segmentation architectures
+
+<AccordionGroup>
+  <Accordion title="UNet">
+    Enhanced UNet with residual units. A flexible encoder-decoder architecture that supports arbitrary depth and channel configurations.
+
+    ```python
+    from monai.networks.nets import UNet
+
+    model = UNet(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=2,
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,     # residual units per block; 0 for plain conv blocks
+        act="PRELU",
+        norm="INSTANCE",
+        dropout=0.0,
+        bias=True,
+    )
+    ```
+
+    **Required parameters:**
+
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `spatial_dims` | `int` | `1`, `2`, or `3` for 1D/2D/3D convolutions |
+    | `in_channels` | `int` | Number of input channels |
+    | `out_channels` | `int` | Number of output channels (classes) |
+    | `channels` | `Sequence[int]` | Feature map sizes from top block down. Must have ≥2 elements |
+    | `strides` | `Sequence[int]` | Downsampling strides. Length must be `len(channels) - 1` |
+
+    Input spatial dimensions must be divisible by `2^(len(strides))`. Use `Resized` or `DivisiblePadd` transforms to meet this requirement.
+  </Accordion>
+
+  <Accordion title="SwinUNETR">
+    Swin Transformer-based UNet for semantic segmentation of 3D medical volumes. Uses shifted window self-attention as the encoder backbone.
+
+    Reference: *Hatamizadeh et al., "Swin UNETR: Swin Transformers for Semantic Segmentation of Brain Tumors in MRI Images"*
+
+    ```python
+    from monai.networks.nets import SwinUNETR
+
+    model = SwinUNETR(
+        in_channels=4,       # e.g., 4 MRI modalities for BraTS
+        out_channels=3,      # e.g., 3 tumor sub-regions
+        feature_size=48,     # base feature dimension; scales through the network
+        spatial_dims=3,
+        depths=(2, 2, 2, 2),
+        num_heads=(3, 6, 12, 24),
+        window_size=7,
+        use_checkpoint=True,  # gradient checkpointing for memory efficiency
+    )
+    ```
+
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `in_channels` | `int` | Input channel count |
+    | `out_channels` | `int` | Output channel count |
+    | `feature_size` | `int` | Base feature dimension (default: `24`) |
+    | `spatial_dims` | `int` | `2` or `3` (default: `3`) |
+    | `depths` | `Sequence[int]` | Transformer blocks per stage |
+    | `num_heads` | `Sequence[int]` | Attention heads per stage |
+    | `window_size` | `int` | Local attention window size (default: `7`) |
+    | `use_checkpoint` | `bool` | Gradient checkpointing to reduce GPU memory |
+    | `use_v2` | `bool` | Use SwinUNETR v2 with residual convolution blocks |
+  </Accordion>
+
+  <Accordion title="SegResNet">
+    Residual encoder-decoder network for 3D brain tumour segmentation, based on autoencoder regularization.
+
+    Reference: *Myronenko, "3D MRI brain tumor segmentation using autoencoder regularization"*
+
+    ```python
+    from monai.networks.nets import SegResNet
+
+    model = SegResNet(
+        spatial_dims=3,
+        in_channels=4,
+        out_channels=3,
+        init_filters=32,      # initial conv output channels; doubles each stage
+        blocks_down=(1, 2, 2, 4),
+        blocks_up=(1, 1, 1),
+        dropout_prob=0.2,
+    )
+    ```
+
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `spatial_dims` | `int` | `2` or `3` (default: `3`) |
+    | `in_channels` | `int` | Input channels (default: `1`) |
+    | `out_channels` | `int` | Output channels (default: `2`) |
+    | `init_filters` | `int` | First conv output size, doubled each encoder stage (default: `8`) |
+    | `blocks_down` | `tuple` | Residual blocks per encoder stage (default: `(1, 2, 2, 4)`) |
+    | `blocks_up` | `tuple` | Residual blocks per decoder stage (default: `(1, 1, 1)`) |
+    | `dropout_prob` | `float \| None` | Dropout probability (default: `None`) |
+  </Accordion>
+
+  <Accordion title="DynUNet">
+    Dynamic UNet implementing the nnU-Net self-configuring design with support for anisotropic kernels and deep supervision.
+
+    Reference: *Isensee et al., "nnU-Net: Self-adapting Framework for U-Net-Based Medical Image Segmentation"*
+
+    ```python
+    from monai.networks.nets import DynUNet
+
+    # Example for cardiac segmentation (2mm anisotropic spacing)
+    model = DynUNet(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=2,
+        kernel_size=[[3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 1]],
+        strides=[[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 1]],
+        upsample_kernel_size=[[2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 1]],
+        deep_supervision=True,
+        deep_supr_num=2,
+    )
+    ```
+
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `spatial_dims` | `int` | `2` or `3` |
+    | `in_channels` | `int` | Input channels |
+    | `out_channels` | `int` | Output channels |
+    | `kernel_size` | `Sequence` | Per-block kernel sizes (can be anisotropic) |
+    | `strides` | `Sequence` | Per-block strides |
+    | `upsample_kernel_size` | `Sequence` | Transpose conv kernels; should equal `strides[1:]` |
+    | `deep_supervision` | `bool` | Enable deep supervision heads |
+    | `filters` | `Sequence \| None` | Explicit per-block channel counts |
+
+    When `deep_supervision=True`, the forward pass in training mode returns a stacked tensor of shape `(B, num_heads+1, C, H, W, D)`.
+  </Accordion>
+
+  <Accordion title="UNETR">
+    Transformer-based encoder with CNN decoder for 3D medical image segmentation. Uses a pure ViT encoder with 16×16×16 patch tokens.
+
+    Reference: *Hatamizadeh et al., "UNETR: Transformers for 3D Medical Image Segmentation"*
+
+    ```python
+    from monai.networks.nets import UNETR
+
+    model = UNETR(
+        in_channels=1,
+        out_channels=14,
+        img_size=(96, 96, 96),
+        feature_size=16,
+        hidden_size=768,
+        mlp_dim=3072,
+        num_heads=12,
+        norm_name="instance",
+        res_block=True,
+        dropout_rate=0.0,
+    )
+    ```
+
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `in_channels` | `int` | Input channels |
+    | `out_channels` | `int` | Output channels |
+    | `img_size` | `Sequence[int] \| int` | Input image size (must be divisible by patch size 16) |
+    | `feature_size` | `int` | Decoder feature size (default: `16`) |
+    | `hidden_size` | `int` | ViT hidden dimension (default: `768`) |
+    | `mlp_dim` | `int` | ViT MLP dimension (default: `3072`) |
+    | `num_heads` | `int` | Attention heads (default: `12`) |
+    | `spatial_dims` | `int` | `2` or `3` (default: `3`) |
+  </Accordion>
+
+  <Accordion title="ViT">
+    Vision Transformer backbone for both segmentation (as encoder) and classification tasks.
+
+    ```python
+    from monai.networks.nets import ViT
+
+    # Segmentation backbone
+    encoder = ViT(
+        in_channels=1,
+        img_size=(96, 96, 96),
+        patch_size=16,
+        hidden_size=768,
+        mlp_dim=3072,
+        num_layers=12,
+        num_heads=12,
+        spatial_dims=3,
+        pos_embed_type="sincos",
+    )
+
+    # Classification
+    classifier = ViT(
+        in_channels=3,
+        img_size=(224, 224),
+        patch_size=16,
+        hidden_size=768,
+        num_layers=12,
+        num_heads=12,
+        classification=True,
+        num_classes=10,
+        spatial_dims=2,
+        pos_embed_type="sincos",
+    )
+    ```
+
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `in_channels` | `int` | Input channels |
+    | `img_size` | `Sequence[int] \| int` | Input image size |
+    | `patch_size` | `Sequence[int] \| int` | Patch token size |
+    | `hidden_size` | `int` | Transformer hidden dimension (default: `768`) |
+    | `num_layers` | `int` | Number of transformer blocks (default: `12`) |
+    | `num_heads` | `int` | Attention heads (default: `12`) |
+    | `classification` | `bool` | Enable classification head (default: `False`) |
+    | `pos_embed_type` | `str` | `"learnable"` or `"sincos"` (default: `"learnable"`) |
+  </Accordion>
+</AccordionGroup>
+
+## Other available architectures
+
+MONAI ships many additional networks for specific tasks:
+
+| Network | Task |
+|---------|------|
+| `AttentionUnet` | UNet with soft attention gates |
+| `BasicUNet` / `BasicUNetPlusPlus` | Lightweight UNet variants |
+| `HighResNet` | High-resolution network for dense prediction |
+| `DenseNet121/169/201/264` | DenseNet classification models |
+| `ResNet` (10/18/34/50/101/152/200) | ResNet classification models |
+| `VNet` | Volumetric segmentation with V-Net |
+| `AutoEncoder` / `VarAutoEncoder` | Autoencoder architectures |
+| `RegUNet` / `VoxelMorph` | Deformable registration networks |
+| `DiffusionModelUNet` | Latent diffusion for image synthesis |
+| `MedNeXt` | ConvNeXt-based 3D segmentation network |
+
+## Loss functions
+
+### Dice-based losses
+
+`DiceLoss` is the most widely used loss function for medical image segmentation tasks. It optimizes the Dice coefficient directly and handles class imbalance better than cross-entropy alone.
+
+```python
+from monai.losses import DiceLoss
+
+loss_fn = DiceLoss(
+    include_background=False,  # exclude channel 0 (background) from loss
+    to_onehot_y=True,          # convert integer label map to one-hot
+    softmax=True,              # apply softmax to logits before computing loss
+    reduction="mean",
+    smooth_nr=1e-5,
+    smooth_dr=1e-5,
+)
+
+# input: (B, C, H, W, D) logits
+# target: (B, 1, H, W, D) integer labels
+loss = loss_fn(predictions, labels)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `include_background` | `bool` | `True` | Include channel 0 in loss computation |
+| `to_onehot_y` | `bool` | `False` | Convert integer targets to one-hot format |
+| `sigmoid` | `bool` | `False` | Apply sigmoid (for binary/multilabel tasks) |
+| `softmax` | `bool` | `False` | Apply softmax (for mutually exclusive classes) |
+| `squared_pred` | `bool` | `False` | Use squared predictions in denominator |
+| `jaccard` | `bool` | `False` | Compute soft IoU (Jaccard) instead of Dice |
+| `batch` | `bool` | `False` | Sum over batch dimension before dividing |
+
+### Combined losses
+
+<Tabs>
+  <Tab title="DiceCELoss">
+    Combines Dice loss and cross-entropy for improved optimization landscape. The most common choice for multi-class segmentation.
+
+    ```python
+    from monai.losses import DiceCELoss
+
+    loss_fn = DiceCELoss(
+        include_background=False,
+        to_onehot_y=True,
+        softmax=True,
+        lambda_dice=1.0,  # weight for Dice component
+        lambda_ce=1.0,    # weight for CE component
+    )
+    ```
+  </Tab>
+  <Tab title="DiceFocalLoss">
+    Combines Dice loss and focal loss. Useful when foreground regions are very small relative to the background.
+
+    ```python
+    from monai.losses import DiceFocalLoss
+
+    loss_fn = DiceFocalLoss(
+        include_background=False,
+        to_onehot_y=True,
+        softmax=True,
+        focal_weight=None,
+        lambda_dice=1.0,
+        lambda_focal=1.0,
+        gamma=2.0,         # focal loss focusing parameter
+    )
+    ```
+  </Tab>
+  <Tab title="GeneralizedDiceLoss">
+    Generalized Dice loss that weights each class contribution by the inverse of its volume. Useful for highly imbalanced segmentation problems.
+
+    ```python
+    from monai.losses import GeneralizedDiceLoss
+
+    loss_fn = GeneralizedDiceLoss(
+        include_background=False,
+        to_onehot_y=True,
+        softmax=True,
+        w_type="square",   # "uniform", "simple", or "square" label weighting
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### Other loss functions
+
+| Loss | Use case |
+|------|----------|
+| `FocalLoss` | Classification/detection with class imbalance |
+| `TverskyLoss` | Dice variant with separate FP/FN penalties via `alpha`/`beta` parameters |
+| `HausdorffDTLoss` | Boundary-aware loss using distance transforms; penalizes large spatial errors |
+| `LogHausdorffDTLoss` | Log-transformed variant of Hausdorff DT loss for numerical stability |
+| `SSIMLoss` | Structural similarity loss for image reconstruction |
+| `ContrastiveLoss` | Self-supervised contrastive learning |
+| `BendingEnergyLoss` | Regularization for deformable registration |
+| `DiffusionLoss` | Diffusion-based regularization for registration |
+| `MaskedDiceLoss` | Dice loss restricted to a spatial mask region |
+| `DeepSupervisionLoss` | Weighted sum loss over deep supervision heads |
+
+### HausdorffDTLoss
+
+Boundary-aware loss that penalizes predictions based on their distance to the true boundary. Useful for tasks where precise boundary delineation matters.
+
+```python
+from monai.losses import HausdorffDTLoss
+
+# Combine with Dice for boundary-accurate segmentation
+dice_loss = DiceLoss(include_background=False, to_onehot_y=True, softmax=True)
+hd_loss = HausdorffDTLoss(include_background=False, to_onehot_y=True, softmax=True)
+
+loss = dice_loss(pred, label) + 0.1 * hd_loss(pred, label)
+```
+
+## Full training example
+
+```python
+import torch
+from monai.networks.nets import UNet
+from monai.losses import DiceCELoss
+from monai.data import CacheDataset, DataLoader
+from monai.transforms import (
+    Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
+    Spacingd, ScaleIntensityRanged, RandCropByPosNegLabeld,
+)
+
+# Model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = UNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=2,
+    channels=(16, 32, 64, 128, 256),
+    strides=(2, 2, 2, 2),
+    num_res_units=2,
+).to(device)
+
+# Loss
+loss_fn = DiceCELoss(
+    include_background=False,
+    to_onehot_y=True,
+    softmax=True,
+)
+
+# Optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+# Data
+data_dicts = [
+    {"image": f"img{i}.nii.gz", "label": f"seg{i}.nii.gz"}
+    for i in range(100)
+]
+
+transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+    ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=(96, 96, 96),
+        pos=1, neg=1, num_samples=4,
+    ),
+])
+
+train_ds = CacheDataset(data=data_dicts, transform=transforms, cache_rate=1.0, num_workers=4)
+train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=4)
+
+# Training loop
+model.train()
+for batch in train_loader:
+    images = batch["image"].to(device)
+    labels = batch["label"].to(device)
+
+    optimizer.zero_grad()
+    outputs = model(images)
+    loss = loss_fn(outputs, labels)
+    loss.backward()
+    optimizer.step()
+```
+
+## Layers and blocks
+
+MONAI's `monai.networks.layers` and `monai.networks.blocks` modules contain the building blocks used internally by the networks. All are spatial-dimension-aware through factory functions:
+
+```python
+from monai.networks.layers import Norm, Act
+from monai.networks.blocks import Convolution, ResidualUnit, UnetrBasicBlock
+
+# Dimension-agnostic convolution + norm + activation
+conv_block = Convolution(
+    spatial_dims=3,
+    in_channels=32,
+    out_channels=64,
+    strides=2,
+    act=Act.PRELU,
+    norm=Norm.INSTANCE,
+    dropout=0.1,
+)
+
+# Residual unit
+res_unit = ResidualUnit(
+    spatial_dims=3,
+    in_channels=64,
+    out_channels=64,
+    strides=1,
+    subunits=2,
+)
+```
+
+The `Norm` and `Act` factories accept string names and resolve them to the correct `nn.Module` for the specified number of spatial dimensions, so the same code builds 2D or 3D models simply by changing `spatial_dims`.

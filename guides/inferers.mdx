@@ -1,0 +1,307 @@
+---
+title: "Inferers"
+description: "Run model inference with SimpleInferer, SlidingWindowInferer, DiffusionInferer, SliceInferer, PatchInferer, and test-time augmentation."
+keywords: ["inference", "sliding window", "SlidingWindowInferer", "DiffusionInferer", "SliceInferer", "PatchInferer", "test-time augmentation"]
+---
+
+## Overview
+
+All inferers in `monai.inferers` implement a single callable interface:
+
+```python
+output = inferer(inputs, network, *args, **kwargs)
+```
+
+This uniform API means you can swap inferers in `SupervisedTrainer` or `SupervisedEvaluator` with a
+single argument change, keeping the rest of your pipeline intact.
+
+<CardGroup cols={2}>
+  <Card title="SimpleInferer" icon="zap">
+    Direct `network(inputs)` forward pass. No overhead; use for patch-based training.
+  </Card>
+  <Card title="SlidingWindowInferer" icon="grid">
+    Tiles a large volume into overlapping windows, runs each through the network, and blends results.
+  </Card>
+  <Card title="SliceInferer" icon="layers">
+    Applies a 2D model slice-by-slice across a 3D volume along a chosen spatial axis.
+  </Card>
+  <Card title="PatchInferer" icon="puzzle">
+    General patch-based inference with pluggable `Splitter` and `Merger` strategies.
+  </Card>
+  <Card title="DiffusionInferer" icon="wind">
+    Forward pass and sampling for score-based diffusion models (DDPM / DDIM).
+  </Card>
+  <Card title="SlidingWindowInfererAdapt" icon="cpu">
+    Adaptive variant that automatically falls back to buffered or CPU stitching on OOM.
+  </Card>
+</CardGroup>
+
+---
+
+## SimpleInferer
+
+`SimpleInferer` calls `network(inputs)` directly. It adds no memory overhead and is the default
+inferer used by `SupervisedTrainer` when none is specified.
+
+```python
+from monai.inferers import SimpleInferer
+
+inferer = SimpleInferer()
+output = inferer(inputs=image_batch, network=model)
+# equivalent to: output = model(image_batch)
+```
+
+Use `SimpleInferer` during training when you are feeding pre-cropped patches and want a simple
+forward pass without any tiling logic.
+
+---
+
+## SlidingWindowInferer
+
+`SlidingWindowInferer` is the standard approach for inference on volumes that are too large to fit
+in GPU memory at once, or when your model was trained on fixed-size patches.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `roi_size` | `Sequence[int] \| int` | — | Spatial size of each inference window (patch). |
+| `sw_batch_size` | `int` | `1` | Number of windows to process in a single `network.forward()` call. |
+| `overlap` | `Sequence[float] \| float` | `0.25` | Fractional overlap between adjacent windows along each dimension (0.0–1.0). Higher overlap improves boundary quality at the cost of more computation. |
+| `mode` | `"constant" \| "gaussian"` | `"constant"` | Blending mode for overlapping predictions. `"gaussian"` weights predictions by a Gaussian centred in each window, reducing edge artefacts. `"constant"` weights all predictions equally. |
+| `sigma_scale` | `float` | `0.125` | Standard deviation of the Gaussian as a fraction of each window dimension when `mode="gaussian"`. |
+| `padding_mode` | `str` | `"constant"` | How to pad the input when the volume is smaller than `roi_size`. |
+| `cval` | `float` | `0.0` | Fill value for `"constant"` padding. |
+| `sw_device` | `device \| None` | input device | Device on which to hold window data during inference. |
+| `device` | `device \| None` | input device | Device on which to stitch the output prediction map. Set to `"cpu"` to save GPU memory. |
+| `progress` | `bool` | `False` | Show a `tqdm` progress bar over windows. |
+| `cache_roi_weight_map` | `bool` | `False` | Precompute and cache the Gaussian weight map. Speeds up repeated inference on the same `roi_size`. |
+| `cpu_thresh` | `int \| None` | `None` | Volume size in voxels above which stitching is automatically moved to CPU to prevent OOM. |
+
+### Overlap
+
+`overlap` controls how much adjacent windows share spatial coverage.
+
+- `overlap=0.0` — windows tile without any shared region; fastest but more visible boundary artefacts.
+- `overlap=0.5` — each window's centre is surrounded by half-window padding; common in practice.
+- `overlap=0.75` — dense tiling; smoothest output but 4× more windows to process.
+
+```python
+from monai.inferers import SlidingWindowInferer
+
+# fast: no overlap, constant blending
+inferer = SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4, overlap=0.0)
+
+# high quality: 50% overlap with Gaussian blending
+inferer = SlidingWindowInferer(
+    roi_size=(96, 96, 96),
+    sw_batch_size=4,
+    overlap=0.5,
+    mode="gaussian",
+    cache_roi_weight_map=True,   # amortise Gaussian computation
+    progress=True,
+)
+```
+
+### Blending mode
+
+<Tabs>
+  <Tab title="constant">
+    Every overlapping window prediction is given equal weight. Cheaper to compute.
+
+    ```python
+    inferer = SlidingWindowInferer(
+        roi_size=(96, 96, 96),
+        sw_batch_size=4,
+        overlap=0.25,
+        mode="constant",
+    )
+    ```
+  </Tab>
+  <Tab title="gaussian">
+    Predictions near window edges receive lower weight than predictions at the window centre.
+    Reduces checkerboard artefacts when `overlap > 0`.
+
+    ```python
+    inferer = SlidingWindowInferer(
+        roi_size=(96, 96, 96),
+        sw_batch_size=4,
+        overlap=0.5,
+        mode="gaussian",
+        sigma_scale=0.125,       # sigma = 0.125 * roi_size
+        cache_roi_weight_map=True,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### Memory-saving options
+
+```python
+# Stitch the output map on CPU to avoid GPU OOM on very large volumes
+inferer = SlidingWindowInferer(
+    roi_size=(160, 160, 160),
+    sw_batch_size=2,
+    overlap=0.5,
+    device=torch.device("cpu"),     # output stitched here
+    sw_device=torch.device("cuda"), # windows inferred here
+)
+
+# Or use the adaptive variant which handles OOM automatically
+from monai.inferers import SlidingWindowInfererAdapt
+
+inferer = SlidingWindowInfererAdapt(
+    roi_size=(160, 160, 160),
+    sw_batch_size=4,
+    overlap=0.5,
+)
+```
+
+---
+
+## SliceInferer
+
+`SliceInferer` extends `SlidingWindowInferer` to apply a **2D model** to a **3D volume** by
+sliding over one spatial axis slice by slice.
+
+```python
+from monai.inferers import SliceInferer
+
+# Slide axial slices (axis 0 = D in [D, H, W])
+inferer = SliceInferer(
+    roi_size=(256, 256),   # 2D spatial size fed to the model
+    sw_batch_size=4,
+    spatial_dim=0,         # 0=axial, 1=coronal, 2=sagittal
+    overlap=0.0,
+)
+
+# model is a 2D UNet; input_volume shape: [B, C, D, H, W]
+output = inferer(inputs=input_volume, network=model_2d)
+# output shape: [B, C, D, H, W]
+```
+
+<Note>
+  `roi_size` must be 2D when `SliceInferer` receives a 3D volume. The inferer internally inserts
+  a size-1 dimension along `spatial_dim` before calling the sliding-window logic, then squeezes
+  it before feeding each slice to the 2D model.
+</Note>
+
+---
+
+## PatchInferer
+
+`PatchInferer` is a composable patch-based inference engine built around pluggable `Splitter` and
+`Merger` components. Use it when you need fine control over how the volume is split and how
+predictions are reassembled.
+
+```python
+from monai.inferers import PatchInferer
+from monai.inferers.splitter import SlidingWindowSplitter
+from monai.inferers.merger import AvgMerger
+
+inferer = PatchInferer(
+    splitter=SlidingWindowSplitter(patch_size=(64, 64, 64), overlap=0.25),
+    merger_cls=AvgMerger,
+    batch_size=8,           # patches per network call
+    preprocessing=None,     # optional per-patch transform before the network
+    postprocessing=None,    # optional per-patch transform after the network
+)
+
+output = inferer(inputs=volume, network=model)
+```
+
+### Merger strategies
+
+| Merger | Behaviour |
+|---|---|
+| `AvgMerger` | Averages overlapping predictions; default. |
+| `ZarrAvgMerger` | Same as `AvgMerger` but writes to an on-disk Zarr array; useful for outputs too large to fit in memory. |
+
+---
+
+## DiffusionInferer
+
+`DiffusionInferer` wraps a `DiffusionModelUNet` and a noise scheduler to provide:
+
+- **Training forward pass** – adds noise to the input at a given timestep and runs the denoising network.
+- **Sampling** – iteratively denoises Gaussian noise to produce new samples.
+- **Log-likelihood** – computes per-image log-likelihoods (DDPMScheduler only).
+
+```python
+from monai.inferers import DiffusionInferer
+from monai.networks.schedulers import DDPMScheduler
+
+scheduler = DDPMScheduler(num_train_timesteps=1000)
+inferer = DiffusionInferer(scheduler=scheduler)
+
+# ── Training forward pass ────────────────────────────────────────────────────
+noise = torch.randn_like(images)
+timesteps = torch.randint(0, 1000, (images.shape[0],), device=device)
+
+predicted_noise = inferer(
+    inputs=images,
+    diffusion_model=model,
+    noise=noise,
+    timesteps=timesteps,
+    condition=conditioning,   # optional cross-attention or concat conditioning
+    mode="crossattn",
+)
+loss = F.mse_loss(predicted_noise, noise)
+
+# ── Sampling (inference) ─────────────────────────────────────────────────────
+scheduler.set_timesteps(num_inference_steps=1000)
+input_noise = torch.randn(1, 1, 64, 64, 64, device=device)
+
+sample = inferer.sample(
+    input_noise=input_noise,
+    diffusion_model=model,
+    scheduler=scheduler,
+    verbose=True,
+    save_intermediates=True,
+    intermediate_steps=100,
+)
+```
+
+<Tip>
+  MONAI also provides `LatentDiffusionInferer`, `ControlNetDiffusionInferer`, and
+  `ControlNetLatentDiffusionInferer` for more advanced generative model architectures.
+</Tip>
+
+---
+
+## Test-time augmentation
+
+Test-time augmentation (TTA) improves prediction quality by running inference on multiple
+transformed versions of the same input and aggregating the results.
+
+```python
+from monai.transforms import (
+    Compose, RandFlipd, RandRotate90d,
+    TestTimeAugmentation,
+)
+from monai.inferers import SlidingWindowInferer
+
+# Define the randomised augmentation transforms to apply at test time
+tta_transforms = Compose([
+    RandFlipd(keys="image", prob=0.5, spatial_axis=0),
+    RandFlipd(keys="image", prob=0.5, spatial_axis=1),
+    RandRotate90d(keys="image", prob=0.5, max_k=3),
+])
+
+tta = TestTimeAugmentation(
+    transform=tta_transforms,
+    label_key="image",
+    batch_size=1,
+    num_workers=0,
+    inferrer_fn=SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4),
+    device=device,
+    num_examples=10,   # number of augmented copies per sample
+)
+
+mode_preds, mean_preds, std_preds, _ = tta(model, dataset_item)
+```
+
+<Note>
+  `TestTimeAugmentation` is in `monai.transforms`. It uses the inferer you supply via
+  `inferrer_fn`, so it is compatible with any `Inferer` subclass.
+</Note>

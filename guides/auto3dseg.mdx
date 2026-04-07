@@ -1,0 +1,274 @@
+---
+title: 'Auto3DSeg'
+description: 'Automated end-to-end 3D medical image segmentation from data analysis to ensemble predictions.'
+---
+
+Auto3DSeg is a comprehensive pipeline that automates 3D medical image segmentation from raw data to final ensemble predictions. It analyzes dataset properties, generates algorithm configurations in MONAI Bundle format, trains multiple models in parallel, and ensembles their checkpoints—requiring only a datalist and a handful of top-level parameters to get started.
+
+<CardGroup cols={2}>
+  <Card title="Data-driven configuration" icon="magnifying-glass">
+    Analyzes intensity distributions, image dimensions, and voxel spacing before generating algorithm configs tailored to your dataset.
+  </Card>
+  <Card title="Multiple algorithms" icon="layer-group">
+    Runs SegResNet, DiNTS, SwinUNETR, and other state-of-the-art architectures in parallel, then ensembles the best checkpoints.
+  </Card>
+  <Card title="Cross-validation support" icon="rotate">
+    Built-in k-fold cross-validation training with configurable fold count.
+  </Card>
+  <Card title="Beginner and expert modes" icon="sliders">
+    Use `AutoRunner` for a one-call experience, or step through each stage individually for full control.
+  </Card>
+</CardGroup>
+
+## Pipeline stages
+
+Auto3DSeg runs four sequential stages. Each stage is independently accessible for custom workflows.
+
+```
+Dataset
+  │
+  ▼
+1. Data Analysis
+   DataAnalyzer → per-case and summary statistics (intensity, shape, spacing)
+  │
+  ▼
+2. Algorithm Generation
+   BundleGen → creates MONAI Bundle configs for each algorithm × fold
+  │
+  ▼
+3. Training
+   Each algorithm trains independently (parallelizable across GPUs)
+  │
+  ▼
+4. Ensembling
+   EnsembleSelection → ranks checkpoints, produces final predictions
+```
+
+<Note>
+Steps 3 and 4 can be distributed across multiple GPUs or nodes. `AutoRunner` handles scheduling automatically when you set `num_gpu` or use a job scheduler.
+</Note>
+
+## AutoRunner
+
+`AutoRunner` is the single entry point for the full pipeline. It takes a `work_dir` and an `input` config (dict or path to a YAML/JSON file) containing the dataset configuration, plus optional flags to control which pipeline stages run.
+
+```python
+from monai.apps.auto3dseg import AutoRunner
+
+# input can be a dict or a path to a YAML/JSON file
+input_cfg = {
+    "modality": "ct",
+    "datalist": "./datalist.json",
+    "dataroot": "/data/Task09_Spleen",
+    "num_fold": 5,
+}
+
+runner = AutoRunner(
+    work_dir="./auto3dseg_work",
+    input=input_cfg,
+    algos=["segresnet", "dints"],
+)
+runner.run()
+```
+
+### Constructor parameters
+
+<AccordionGroup>
+  <Accordion title="input (required)">
+    Dataset configuration as a dict or path to a YAML/JSON file. Required keys:
+
+    | Key | Description |
+    |-----|-------------|
+    | `datalist` | Path to a JSON datalist file listing training/validation/testing cases |
+    | `dataroot` | Root directory for all data files referenced in the datalist |
+    | `modality` | `"ct"` or `"mri"` — controls normalization strategy |
+    | `num_fold` | Number of cross-validation folds (optional, auto-detected from datalist if omitted) |
+
+    The datalist format uses `"training"`, `"validation"`, and `"testing"` splits, each containing a list of dicts with `"image"` and `"label"` keys:
+
+    ```json
+    {
+      "training": [
+        {"image": "imagesTr/spleen_2.nii.gz", "label": "labelsTr/spleen_2.nii.gz"},
+        {"image": "imagesTr/spleen_3.nii.gz", "label": "labelsTr/spleen_3.nii.gz"}
+      ],
+      "testing": [
+        {"image": "imagesTs/spleen_1.nii.gz"}
+      ]
+    }
+    ```
+
+    Paths in the datalist are resolved relative to `dataroot`.
+  </Accordion>
+  <Accordion title="work_dir">
+    Output directory for all intermediate files: data statistics, generated algorithm configs, training checkpoints, and final predictions.
+
+    ```
+    work_dir/
+    ├── input.yaml              # saved copy of input config
+    ├── datastats.yaml          # data analysis output
+    ├── segresnet_fold0/        # training output per algo × fold
+    ├── segresnet_fold1/
+    ├── ...
+    └── ensemble_output/        # final predictions
+    ```
+  </Accordion>
+  <Accordion title="algos">
+    List of algorithm names to run. Defaults to all available algorithms if not set.
+
+    ```python
+    runner = AutoRunner(
+        input=input_cfg,
+        algos=["segresnet", "dints"],  # run only these two
+    )
+    ```
+
+    Available algorithms include `"segresnet"`, `"dints"`, `"swinunetr"`, and `"segresnet2d"`. The exact set depends on your MONAI version and installed research-contributions algorithms.
+  </Accordion>
+  <Accordion title="Stage control flags">
+    Pass these to skip already-completed stages:
+
+    | Parameter | Default | Description |
+    |-----------|---------|-------------|
+    | `analyze` | auto | Run data analysis. Auto-skipped if `datastats.yaml` exists in cache. |
+    | `algo_gen` | auto | Run algorithm generation. Auto-skipped if configs cached. |
+    | `train` | auto | Run training. Auto-skipped if checkpoints cached. |
+    | `ensemble` | `True` | Run ensembling and produce final predictions. |
+
+    ```python
+    runner = AutoRunner(
+        input=input_cfg,
+        analyze=False,    # skip if datastats.yaml already exists
+        algo_gen=False,   # skip if configs already generated
+        ensemble=False,   # skip ensembling, just train
+    )
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Full working example
+
+```python
+from monai.apps.auto3dseg import AutoRunner
+
+input_cfg = {
+    "modality": "ct",
+    "datalist": "./datalist.json",
+    "dataroot": "/data/Task09_Spleen",
+    "num_fold": 5,
+}
+
+runner = AutoRunner(
+    work_dir="./spleen_auto3dseg",
+    input=input_cfg,
+    algos=["segresnet", "dints"],
+)
+
+# Run the full pipeline: analyze → generate → train → ensemble
+runner.run()
+```
+
+After `runner.run()` completes, predictions are written to `{work_dir}/ensemble_output/`.
+
+## Running individual stages
+
+You can run each stage independently for inspection or custom orchestration.
+
+<Steps>
+  <Step title="Data analysis">
+    ```python
+    from monai.apps.auto3dseg import DataAnalyzer
+
+    analyzer = DataAnalyzer(
+        datalist="./datalist.json",
+        dataroot="/data/Task09_Spleen",
+        output_path="./datastats.yaml",
+    )
+    analyzer.get_all_case_stats()
+    ```
+
+    The output YAML contains per-case and summary statistics: image shapes, voxel spacings, intensity histograms, foreground label counts, and more.
+  </Step>
+  <Step title="Algorithm generation">
+    ```python
+    from monai.apps.auto3dseg import BundleGen
+
+    bundle_generator = BundleGen(
+        algo_path="./algorithm_templates",
+        data_stats_filename="./datastats.yaml",
+        data_src_cfg_name="./datalist.json",
+    )
+    bundle_generator.generate("./work_dir", num_fold=5)
+    algo_dict = bundle_generator.get_algo_dict()
+    ```
+  </Step>
+  <Step title="Training">
+    Each generated algorithm exposes a `train()` method. You can load algorithms from pickle and train them individually.
+
+    ```python
+    from monai.apps.auto3dseg import import_bundle_algo_history
+
+    # Load all algorithms generated in the previous step
+    history = import_bundle_algo_history("./work_dir", only_trained=False)
+    for algo_dict in history:
+        algo = algo_dict["algo"]
+        algo.train(params={"MONAI_LOCAL_TEMP_DIR": "./work_dir"})
+    ```
+  </Step>
+  <Step title="Ensembling">
+    ```python
+    from monai.apps.auto3dseg import EnsembleRunner
+
+    ensemble = EnsembleRunner(
+        data_src_cfg_name="./work_dir/input.yaml",
+        work_dir="./work_dir",
+        num_fold=5,
+    )
+    ensemble.run()
+    ```
+  </Step>
+</Steps>
+
+## Output structure
+
+After a full run, `work_dir` contains:
+
+```
+work_dir/
+├── datastats.yaml                   # data analysis results
+├── segresnet_fold0/
+│   ├── algo.pkl                     # serialized algo object
+│   ├── configs/
+│   │   └── hyper_parameters.yaml   # generated hyperparameters
+│   └── models/
+│       ├── model.pt                 # best checkpoint
+│       └── model_final.pt          # final checkpoint
+├── segresnet_fold1/
+│   └── ...
+├── dints_fold0/
+│   └── ...
+└── ensemble_output/
+    ├── pred_case1.nii.gz            # final ensemble predictions
+    └── pred_case2.nii.gz
+```
+
+## When to use Auto3DSeg vs a manual pipeline
+
+<Tabs>
+  <Tab title="Use Auto3DSeg when">
+    - You are starting a new segmentation project and want strong baselines quickly.
+    - Your dataset is standard (CT or MRI, single or multi-class labels).
+    - You want reproducible, data-driven hyperparameter selection.
+    - You are participating in a segmentation challenge and need a competitive starting point.
+  </Tab>
+  <Tab title="Use a manual pipeline when">
+    - You have domain-specific preprocessing requirements that Auto3DSeg cannot accommodate.
+    - Your task is not segmentation (e.g., registration, detection, synthesis).
+    - You need fine-grained control over loss functions, augmentations, or network architecture.
+    - You are integrating into an existing training framework with its own conventions.
+  </Tab>
+</Tabs>
+
+<Tip>
+Auto3DSeg and manual pipelines are not mutually exclusive. You can use Auto3DSeg to identify the best architecture and hyperparameters, then fine-tune that specific bundle manually for production.
+</Tip>

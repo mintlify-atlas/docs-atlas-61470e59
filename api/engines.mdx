@@ -1,0 +1,304 @@
+---
+title: 'monai.engines'
+description: 'Training and evaluation engines built on PyTorch Ignite for orchestrating supervised and adversarial workflows.'
+---
+
+The `monai.engines` module provides high-level training and evaluation orchestration built on [PyTorch Ignite](https://pytorch.org/ignite/). Engines manage the training loop, metric tracking, event handling, and automatic mixed precision.
+
+<Note>
+MONAI engines require PyTorch Ignite (`pip install monai[ignite]`). Event handlers from `monai.handlers` attach to these engines via the `train_handlers` / `val_handlers` arguments.
+</Note>
+
+## Trainers
+
+### SupervisedTrainer
+
+Standard supervised training loop with image/label pairs. Handles forward pass, loss computation, backward pass, and optimizer step.
+
+```python
+import torch
+from monai.engines import SupervisedTrainer
+from monai.inferers import SimpleInferer
+from monai.losses import DiceCELoss
+from monai.handlers import StatsHandler, ValidationHandler
+
+trainer = SupervisedTrainer(
+    device=torch.device("cuda:0"),
+    max_epochs=100,
+    train_data_loader=train_loader,
+    network=model,
+    optimizer=torch.optim.AdamW(model.parameters(), lr=1e-4),
+    loss_function=DiceCELoss(to_onehot_y=True, softmax=True),
+    inferer=SimpleInferer(),
+    train_handlers=[
+        StatsHandler(tag_name="train_loss"),
+        ValidationHandler(validator=evaluator, interval=5),
+    ],
+    amp=True,
+)
+
+trainer.run()
+```
+
+<ParamField path="device" type="str | torch.device" required>
+  Device to run training on.
+</ParamField>
+
+<ParamField path="max_epochs" type="int" required>
+  Total number of training epochs.
+</ParamField>
+
+<ParamField path="train_data_loader" type="Iterable | DataLoader" required>
+  Training data source.
+</ParamField>
+
+<ParamField path="network" type="torch.nn.Module" required>
+  Model to train.
+</ParamField>
+
+<ParamField path="optimizer" type="Optimizer" required>
+  PyTorch optimizer.
+</ParamField>
+
+<ParamField path="loss_function" type="Callable" required>
+  Loss function called with `(network_output, targets)`.
+</ParamField>
+
+<ParamField path="inferer" type="Inferer | None">
+  Inference method. Defaults to `SimpleInferer()`. Use `SlidingWindowInferer` for large volumes.
+</ParamField>
+
+<ParamField path="postprocessing" type="Transform | None">
+  Transform applied to model output after each iteration (e.g., argmax, one-hot decoding).
+</ParamField>
+
+<ParamField path="key_train_metric" type="dict[str, Metric] | None">
+  Primary Ignite metric attached to the engine state. Used for model checkpoint comparisons.
+</ParamField>
+
+<ParamField path="train_handlers" type="Sequence | None">
+  List of event handlers attached to the training engine. Each must implement `attach(engine)`.
+</ParamField>
+
+<ParamField path="amp" type="bool" default="False">
+  Enable automatic mixed precision (AMP) using `torch.cuda.amp`.
+</ParamField>
+
+<ParamField path="decollate" type="bool" default="True">
+  Decollate batched outputs into per-sample dictionaries before post-processing. Required when using MONAI dictionary transforms in `postprocessing`.
+</ParamField>
+
+<ParamField path="accumulation_steps" type="int" default="1">
+  Gradient accumulation steps. Simulates a larger batch size on memory-constrained hardware.
+</ParamField>
+
+---
+
+### GanTrainer / AdversarialTrainer
+
+Manages the adversarial training loop for GAN-based models, alternating generator and discriminator updates.
+
+```python
+from monai.engines import GanTrainer
+
+trainer = GanTrainer(
+    device=device,
+    max_epochs=200,
+    train_data_loader=loader,
+    g_network=generator,
+    g_optimizer=g_optim,
+    g_loss_function=g_loss,
+    d_network=discriminator,
+    d_optimizer=d_optim,
+    d_loss_function=d_loss,
+    d_train_steps=1,
+    g_train_steps=1,
+)
+trainer.run()
+```
+
+<ParamField path="g_network" type="torch.nn.Module" required>
+  Generator network.
+</ParamField>
+
+<ParamField path="d_network" type="torch.nn.Module" required>
+  Discriminator network.
+</ParamField>
+
+<ParamField path="d_train_steps" type="int" default="1">
+  Number of discriminator update steps per generator step.
+</ParamField>
+
+---
+
+## Evaluators
+
+### SupervisedEvaluator
+
+Runs evaluation over a validation set, computing metrics and invoking handlers at each iteration and epoch end.
+
+```python
+import torch
+from monai.engines import SupervisedEvaluator
+from monai.inferers import SlidingWindowInferer
+from monai.metrics import DiceMetric
+from monai.transforms import Compose, Activationsd, AsDiscreted
+from monai.handlers import StatsHandler, MeanDice, CheckpointSaver
+
+post_transform = Compose([
+    Activationsd(keys="pred", softmax=True),
+    AsDiscreted(keys=["pred", "label"], argmax=[True, False], to_onehot=2),
+])
+
+evaluator = SupervisedEvaluator(
+    device=torch.device("cuda:0"),
+    val_data_loader=val_loader,
+    network=model,
+    inferer=SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4),
+    postprocessing=post_transform,
+    key_val_metric={"val_mean_dice": MeanDice(include_background=False, output_transform=from_engine(["pred", "label"]))},
+    val_handlers=[
+        StatsHandler(output_transform=lambda x: None),
+        CheckpointSaver(save_dir="./checkpoints", save_dict={"net": model}, save_key_metric=True),
+    ],
+    amp=True,
+)
+```
+
+<ParamField path="device" type="str | torch.device" required>
+  Device to run evaluation on.
+</ParamField>
+
+<ParamField path="val_data_loader" type="Iterable | DataLoader" required>
+  Validation data source.
+</ParamField>
+
+<ParamField path="network" type="torch.nn.Module" required>
+  Model to evaluate.
+</ParamField>
+
+<ParamField path="inferer" type="Inferer | None">
+  Inference method applied to each batch.
+</ParamField>
+
+<ParamField path="postprocessing" type="Transform | None">
+  Post-processing transforms applied to network outputs.
+</ParamField>
+
+<ParamField path="key_val_metric" type="dict[str, Metric] | None">
+  Primary validation metric. The engine stores its value in `engine.state.metrics`.
+</ParamField>
+
+<ParamField path="val_handlers" type="Sequence | None">
+  Handlers attached to the evaluation engine.
+</ParamField>
+
+<ParamField path="amp" type="bool" default="False">
+  Enable AMP during evaluation.
+</ParamField>
+
+---
+
+### EnsembleEvaluator
+
+Evaluates an ensemble of models and merges their predictions before computing metrics.
+
+```python
+from monai.engines import EnsembleEvaluator
+from monai.transforms import MeanEnsembled
+
+evaluator = EnsembleEvaluator(
+    device=device,
+    val_data_loader=val_loader,
+    networks=[model1, model2, model3],
+    inferer=SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4),
+    postprocessing=Compose([
+        MeanEnsembled(keys="pred", output_key="pred"),
+        AsDiscreted(keys="pred", argmax=True, to_onehot=14),
+    ]),
+    pred_keys=["pred0", "pred1", "pred2"],
+)
+```
+
+<ParamField path="networks" type="Sequence[torch.nn.Module]" required>
+  List of models whose outputs will be aggregated.
+</ParamField>
+
+<ParamField path="pred_keys" type="Sequence[str]" required>
+  Keys under which each model's prediction is stored before ensemble.
+</ParamField>
+
+---
+
+## Event system
+
+MONAI engines expose a rich event system via PyTorch Ignite. Use `add_event_handler` to attach callbacks at specific training milestones.
+
+```python
+from ignite.engine import Events
+
+@trainer.on(Events.EPOCH_COMPLETED)
+def log_metrics(engine):
+    print(f"Epoch {engine.state.epoch}: loss={engine.state.output:.4f}")
+
+# Or using add_event_handler:
+def save_model(engine):
+    torch.save(model.state_dict(), f"epoch_{engine.state.epoch}.pt")
+
+trainer.add_event_handler(Events.EPOCH_COMPLETED(every=10), save_model)
+```
+
+### IterationEvents
+
+MONAI-specific fine-grained iteration events fired within each training step.
+
+```python
+from monai.engines.utils import IterationEvents
+
+@trainer.on(IterationEvents.FORWARD_COMPLETED)
+def inspect_output(engine):
+    print(engine.state.output["pred"].shape)
+
+@trainer.on(IterationEvents.LOSS_COMPLETED)
+def log_loss(engine):
+    print(engine.state.output["loss"])
+```
+
+| Event | Fired when |
+|-------|------------|
+| `IterationEvents.FORWARD_COMPLETED` | After `network(inputs)` |
+| `IterationEvents.LOSS_COMPLETED` | After `loss_function(pred, label)` |
+| `IterationEvents.BACKWARD_COMPLETED` | After `loss.backward()` |
+| `IterationEvents.MODEL_COMPLETED` | After `optimizer.step()` |
+
+---
+
+## Common handlers (monai.handlers)
+
+Handlers attach to engines and provide logging, checkpointing, early stopping, and metric computation.
+
+| Handler | Purpose |
+|---------|---------|
+| `StatsHandler` | Logs loss and metrics to console/logger |
+| `TensorBoardStatsHandler` | Writes scalars to TensorBoard |
+| `CheckpointSaver` | Saves model and optimizer checkpoints |
+| `CheckpointLoader` | Restores from a checkpoint |
+| `ValidationHandler` | Triggers evaluation at specified intervals |
+| `EarlyStopHandler` | Stops training when metric plateaus |
+| `LrScheduleHandler` | Steps a learning rate scheduler |
+| `MeanDice` | Computes mean Dice after each evaluation epoch |
+| `MLFlowHandler` | Logs metrics and artifacts to MLflow |
+
+```python
+from monai.handlers import CheckpointSaver, StatsHandler, ValidationHandler
+
+train_handlers = [
+    StatsHandler(tag_name="train_loss"),
+    ValidationHandler(validator=evaluator, interval=1),
+    CheckpointSaver(
+        save_dir="./checkpoints",
+        save_dict={"net": model, "opt": optimizer},
+        save_key_metric=True,
+    ),
+]
+```

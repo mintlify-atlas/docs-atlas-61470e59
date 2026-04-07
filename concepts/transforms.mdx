@@ -1,0 +1,354 @@
+---
+title: 'Transforms'
+description: 'Domain-specific image processing operations built on PyTorch, with array and dictionary variants for flexible medical imaging pipelines.'
+---
+
+Transforms are the primary building block for data preprocessing and augmentation in MONAI. They are callable objects built on PyTorch that accept tensors or dictionaries of tensors and return processed results.
+
+## Array vs dictionary transforms
+
+MONAI provides two variants of every transform.
+
+**Array transforms** operate on a single tensor. They accept a `torch.Tensor` (or `np.ndarray`) and return the same type.
+
+**Dictionary transforms** (the `d`-suffix variants) operate on a Python dictionary. They accept and return a `dict`, applying the operation only to the specified keys. This pattern is essential when your data sample contains multiple fields that must be processed consistently — for example, applying the same spatial augmentation to both an image and its segmentation label.
+
+<Tabs>
+  <Tab title="Array style">
+    ```python
+    from monai.transforms import (
+        LoadImage,
+        EnsureChannelFirst,
+        ScaleIntensityRange,
+        RandAffine,
+        Compose,
+    )
+
+    transforms = Compose([
+        LoadImage(image_only=True),
+        EnsureChannelFirst(),
+        ScaleIntensityRange(a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
+        RandAffine(prob=0.5, rotate_range=(0.1, 0.1, 0.1)),
+    ])
+
+    # Apply to a single image path
+    result = transforms("image.nii.gz")
+    ```
+  </Tab>
+  <Tab title="Dictionary style">
+    ```python
+    from monai.transforms import (
+        LoadImaged,
+        EnsureChannelFirstd,
+        ScaleIntensityRanged,
+        RandAffined,
+        Compose,
+    )
+
+    transforms = Compose([
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        ScaleIntensityRanged(
+            keys=["image"],
+            a_min=-57, a_max=164,
+            b_min=0.0, b_max=1.0,
+            clip=True,
+        ),
+        # Same spatial transform applied to both image and label
+        RandAffined(
+            keys=["image", "label"],
+            prob=0.5,
+            rotate_range=(0.1, 0.1, 0.1),
+        ),
+    ])
+
+    # Apply to a dictionary sample
+    sample = {"image": "image.nii.gz", "label": "label.nii.gz"}
+    result = transforms(sample)
+    # result["image"] and result["label"] have the same spatial transform applied
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+Dictionary transforms use the same lowercase base name with a `d` suffix (e.g., `LoadImage` → `LoadImaged`). Aliases with `D` and `Dict` suffixes also exist (e.g., `LoadImageD`, `LoadImageDict`) and are functionally identical.
+</Note>
+
+## Transform categories
+
+<AccordionGroup>
+  <Accordion title="Spatial transforms">
+    Spatial transforms change the geometry of an image. They are among the most impactful augmentations for 3D medical imaging tasks.
+
+    | Transform | Description |
+    |-----------|-------------|
+    | `Spacing` / `Spacingd` | Resample to target voxel spacing |
+    | `Orientation` / `Orientationd` | Reorient to a standard axis code (e.g., `"RAS"`) |
+    | `Resize` / `Resized` | Resize to a fixed spatial shape |
+    | `Flip` / `Flipd` | Flip along specified axes |
+    | `Rotate90` / `Rotate90d` | Rotate by multiples of 90 degrees |
+    | `RandAffine` / `RandAffined` | Random affine transformation (rotation, shear, zoom) |
+    | `Rand2DElastic` / `Rand3DElastic` | Random elastic deformation |
+    | `RandFlip` / `RandFlipd` | Random flip along a random axis |
+    | `RandRotate` / `RandRotated` | Random rotation within a range |
+    | `RandZoom` / `RandZoomd` | Random zoom within a range |
+    | `SpatialCrop` / `SpatialCropd` | Crop a region of interest |
+    | `CropForeground` / `CropForegroundd` | Crop to the bounding box of foreground content |
+    | `RandCropByPosNegLabel` / `RandCropByPosNegLabeld` | Random crop balanced by positive/negative label ratio |
+
+    ```python
+    from monai.transforms import RandAffined, Spacingd
+
+    # Resample to isotropic 1.5mm spacing
+    resample = Spacingd(
+        keys=["image", "label"],
+        pixdim=(1.5, 1.5, 1.5),
+        mode=("bilinear", "nearest"),
+    )
+
+    # Random affine augmentation for both image and label
+    rand_aug = RandAffined(
+        keys=["image", "label"],
+        prob=0.8,
+        rotate_range=(0.26, 0.26, 0.26),   # ~15 degrees
+        scale_range=(0.1, 0.1, 0.1),
+        mode=("bilinear", "nearest"),
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="Intensity transforms">
+    Intensity transforms modify pixel/voxel values without changing spatial dimensions.
+
+    | Transform | Description |
+    |-----------|-------------|
+    | `ScaleIntensityRange` / `ScaleIntensityRanged` | Clip and rescale by explicit min/max |
+    | `NormalizeIntensity` / `NormalizeIntensityd` | Normalize by mean and standard deviation |
+    | `RandGaussianNoise` / `RandGaussianNoised` | Add random Gaussian noise |
+    | `RandBiasField` / `RandBiasFieldd` | Simulate MRI bias field artifact |
+    | `RandGibbsNoise` / `RandGibbsNoised` | Simulate Gibbs ringing artifact |
+    | `HistogramNormalize` / `HistogramNormalized` | Histogram equalization |
+    | `RandScaleIntensity` / `RandScaleIntensityd` | Randomly scale intensity values |
+    | `RandShiftIntensity` / `RandShiftIntensityd` | Randomly shift intensity values |
+    | `MaskIntensity` / `MaskIntensityd` | Zero out voxels outside a mask |
+
+    ```python
+    from monai.transforms import ScaleIntensityRanged, NormalizeIntensityd
+
+    # CT windowing: clip HU values and scale to [0, 1]
+    ct_window = ScaleIntensityRanged(
+        keys=["image"],
+        a_min=-57,    # lower HU bound
+        a_max=164,    # upper HU bound
+        b_min=0.0,
+        b_max=1.0,
+        clip=True,
+    )
+
+    # Zero-mean, unit-std normalization (useful for MRI)
+    normalize = NormalizeIntensityd(
+        keys=["image"],
+        nonzero=True,   # compute stats from non-zero voxels only
+        channel_wise=True,
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="I/O transforms">
+    I/O transforms load and save medical images, handling format-specific metadata automatically.
+
+    | Transform | Description |
+    |-----------|-------------|
+    | `LoadImage` / `LoadImaged` | Load images from disk (NIfTI, DICOM, PNG, etc.) |
+    | `SaveImage` / `SaveImaged` | Save tensors back to disk with correct metadata |
+    | `EnsureChannelFirst` / `EnsureChannelFirstd` | Ensure the channel dimension is first |
+
+    `LoadImage` and `LoadImaged` automatically populate `MetaTensor` metadata including the affine matrix, spacing, and orientation. Supported backends include NiBabel (NIfTI/NRRD), ITK (DICOM, MHD, etc.), PIL (PNG/JPG), and NumPy.
+
+    ```python
+    from monai.transforms import LoadImaged, SaveImaged
+
+    load = LoadImaged(
+        keys=["image", "label"],
+        image_only=False,   # also load metadata
+    )
+
+    save = SaveImaged(
+        keys=["image"],
+        output_dir="./output",
+        output_postfix="pred",
+        resample=False,
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="Post-processing transforms">
+    Post-processing transforms convert raw network outputs into final predictions.
+
+    | Transform | Description |
+    |-----------|-------------|
+    | `Activations` / `Activationsd` | Apply sigmoid or softmax to logits |
+    | `AsDiscrete` / `AsDiscreted` | Threshold to binary or argmax for multi-class |
+    | `KeepLargestConnectedComponent` / `KeepLargestConnectedComponentd` | Remove small spurious predictions |
+    | `FillHoles` / `FillHolesd` | Fill holes inside predicted regions |
+    | `LabelFilter` / `LabelFilterd` | Keep only specified label values |
+    | `RemoveSmallObjects` / `RemoveSmallObjectsd` | Remove connected components below a size threshold |
+    | `Invert` / `Invertd` | Invert preprocessing transforms on model output |
+    | `MeanEnsemble` / `MeanEnsembled` | Average predictions from multiple models |
+
+    ```python
+    from monai.transforms import (
+        Activationsd,
+        AsDiscreted,
+        KeepLargestConnectedComponentd,
+        Compose,
+    )
+
+    post_transforms = Compose([
+        Activationsd(keys=["pred"], softmax=True),
+        AsDiscreted(keys=["pred"], argmax=True, to_onehot=3),
+        KeepLargestConnectedComponentd(keys=["pred"], applied_labels=[1, 2]),
+    ])
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Compose
+
+`Compose` chains a sequence of transforms into a single callable. It handles both array and dictionary styles transparently.
+
+```python
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
+    ScaleIntensityRanged,
+    RandCropByPosNegLabeld,
+    RandFlipd,
+    RandRotate90d,
+)
+
+train_transforms = Compose([
+    # Deterministic preprocessing
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(
+        keys=["image", "label"],
+        pixdim=(1.5, 1.5, 2.0),
+        mode=("bilinear", "nearest"),
+    ),
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=-57, a_max=164,
+        b_min=0.0, b_max=1.0,
+        clip=True,
+    ),
+    # Random augmentations
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=(96, 96, 96),
+        pos=1, neg=1, num_samples=4,
+    ),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandRotate90d(keys=["image", "label"], prob=0.5),
+])
+```
+
+MONAI also provides specialized compose variants:
+
+- **`OneOf`**: randomly selects one transform from a list, with optional per-transform weights
+- **`RandomOrder`**: applies all transforms in a random order
+- **`SomeOf`**: applies a random subset of transforms
+
+```python
+from monai.transforms import OneOf, RandGaussianNoised, RandBiasFieldd, RandGibbsNoised
+
+# Apply exactly one of these MRI artifact simulations
+artifact_aug = OneOf([
+    RandGaussianNoised(keys=["image"], prob=1.0, std=0.05),
+    RandBiasFieldd(keys=["image"], prob=1.0),
+    RandGibbsNoised(keys=["image"], prob=1.0),
+])
+```
+
+## Randomizable transforms
+
+Transforms with the `Rand` prefix are randomizable. They internally use `np.random.RandomState` and expose a `set_random_state` method for reproducibility.
+
+```python
+from monai.transforms import RandFlip
+
+transform = RandFlip(prob=0.5, spatial_axis=0)
+
+# Fix the random state for reproducibility
+transform.set_random_state(seed=42)
+
+# Or pass a numpy RandomState object
+import numpy as np
+transform.set_random_state(state=np.random.RandomState(42))
+```
+
+For global determinism across an entire training run, use `set_determinism`:
+
+```python
+from monai.utils import set_determinism
+
+set_determinism(seed=42)  # affects all MONAI randomizable transforms
+```
+
+`Compose` propagates its random seed to all contained `Randomizable` transforms, ensuring consistent behavior when seeded:
+
+```python
+transforms = Compose([RandFlipd(...), RandRotate90d(...)])
+transforms.set_random_state(seed=42)
+```
+
+## Invertible transforms
+
+Many MONAI transforms implement `InvertibleTransform`, which means they record enough information to reverse the operation. This is critical for mapping model predictions back to the original image space.
+
+The applied operations are tracked in each `MetaTensor`'s `applied_operations` list. To invert:
+
+```python
+from monai.transforms import Compose, Invertd
+
+# Use Invertd in your post-processing pipeline
+post_transforms = Compose([
+    Invertd(
+        keys=["pred"],
+        transform=train_transforms,  # the original preprocessing pipeline
+        orig_keys=["image"],         # which key to look up original metadata from
+        nearest_interp=False,
+        to_tensor=True,
+    ),
+])
+```
+
+You can also call `.inverse()` directly on a `Compose` instance:
+
+```python
+transformed = train_transforms(sample)
+# ... run inference ...
+original_space = train_transforms.inverse(transformed)
+```
+
+## Lazy resampling
+
+Lazy resampling is an optimization that batches spatial operations (such as `Spacing`, `Orientation`, `RandAffine`) so that the actual resampling is performed only once, reducing interpolation artifacts and computation time.
+
+Enable it on a `Compose` instance:
+
+```python
+lazy_transforms = Compose(
+    [Spacingd(...), Orientationd(...), RandAffined(...)],
+    lazy=True,
+)
+```
+
+<Note>
+Lazy resampling is an experimental feature. Not all transforms support it. Check the `lazy` property on individual transform classes for compatibility.
+</Note>

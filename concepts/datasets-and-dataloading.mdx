@@ -1,0 +1,292 @@
+---
+title: 'Datasets and data loading'
+description: 'MONAI extends PyTorch Dataset and DataLoader with caching, persistent storage, smart replacement, and predefined medical imaging datasets.'
+---
+
+MONAI extends PyTorch's `Dataset` and `DataLoader` APIs with domain-specific caching strategies, predefined medical datasets, and utilities for cross-validation and patch-based training.
+
+## Dataset hierarchy
+
+```
+torch.utils.data.Dataset
+└── monai.data.Dataset              # base class with transform support
+    ├── monai.data.CacheDataset     # in-memory caching of deterministic transforms
+    │   └── SmartCacheDataset       # dynamic sliding-window cache replacement
+    └── PersistentDataset           # disk-based caching (survives restarts)
+        └── CacheNTransDataset      # cache first N transforms regardless of randomness
+```
+
+The base `Dataset` applies transforms on every access with no caching. Each subclass trades memory or disk space for faster repeated access.
+
+## CacheDataset
+
+`CacheDataset` accelerates training by pre-computing all deterministic (non-random) transforms once and storing the results in RAM. On each epoch, only the random transforms are re-applied to the cached data.
+
+MONAI automatically identifies the split point: it caches everything up to the first `Randomizable` transform in the `Compose` chain.
+
+```python
+from monai.data import CacheDataset, DataLoader
+from monai.transforms import (
+    Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
+    Spacingd, ScaleIntensityRanged, RandCropByPosNegLabeld,
+    RandFlipd, RandRotate90d,
+)
+
+data_dicts = [
+    {"image": "img1.nii.gz", "label": "seg1.nii.gz"},
+    {"image": "img2.nii.gz", "label": "seg2.nii.gz"},
+    # ...
+]
+
+transforms = Compose([
+    # These will be cached:
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+    ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
+    # These run fresh each epoch (first Randomizable transform):
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=(96, 96, 96),
+        pos=1, neg=1,
+        num_samples=4,
+    ),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandRotate90d(keys=["image", "label"], prob=0.5),
+])
+
+train_ds = CacheDataset(
+    data=data_dicts,
+    transform=transforms,
+    cache_rate=1.0,     # cache 100% of the dataset
+    num_workers=4,      # parallel workers for cache population
+)
+
+train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=4)
+```
+
+### Key parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `cache_rate` | `float` | Fraction of data to cache (0.0–1.0). Default: `1.0` |
+| `cache_num` | `int` | Absolute number of items to cache. Takes the minimum of `cache_num` and `cache_rate * len(data)` |
+| `num_workers` | `int` | Threads used during cache population at startup. Default: `1` |
+| `copy_cache` | `bool` | Whether to deep-copy cached items before applying random transforms. Default: `True` |
+| `runtime_cache` | `bool \| str` | If `True` or `"threads"`, compute cache on first access rather than at startup |
+
+<Tip>
+Set `cache_rate=0.0` during debugging to skip cache population entirely, then increase it for full training runs.
+</Tip>
+
+## PersistentDataset
+
+`PersistentDataset` writes cached results to disk rather than RAM. This is ideal for very large datasets that don't fit in memory, and the cache survives process restarts so you pay the transformation cost only once across multiple experiments.
+
+```python
+from monai.data import PersistentDataset
+
+persistent_ds = PersistentDataset(
+    data=data_dicts,
+    transform=transforms,
+    cache_dir="./persistent_cache",  # directory to store .pt files
+)
+```
+
+Each item is hashed (based on the input file paths) and stored as a `.pt` file under `cache_dir`. On subsequent runs, results are loaded directly from disk.
+
+<Warning>
+If you change the deterministic transforms in your pipeline, the cached files become stale. Either delete `cache_dir` manually or use the `hash_transform` parameter to include transform configuration in the cache key.
+</Warning>
+
+### Key parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `cache_dir` | `Path \| str \| None` | Directory for cached `.pt` files. If `None`, caching is disabled |
+| `hash_func` | `Callable` | Hash function for cache keys. Default: `pickle_hashing` |
+| `hash_transform` | `Callable \| None` | Optional hash of transforms to detect pipeline changes |
+| `reset_ops_id` | `bool` | Strip transform instance IDs from cached tensors. Default: `True` |
+
+## SmartCacheDataset
+
+`SmartCacheDataset` implements the NVIDIA Clara SmartCache algorithm. It maintains a sliding window cache pool: only a subset of data is cached at any time, and a background thread continuously replaces a fraction of the cache with new items after each epoch.
+
+This is useful when the full dataset is too large to cache entirely but you still want significant caching benefits.
+
+```python
+from monai.data import SmartCacheDataset
+
+smart_ds = SmartCacheDataset(
+    data=data_dicts,
+    transform=transforms,
+    cache_rate=0.5,       # cache 50% of data at a time
+    replace_rate=0.2,     # replace 20% of cached items each epoch
+    num_init_workers=4,
+    num_replace_workers=2,
+)
+
+# SmartCacheDataset requires explicit lifecycle management:
+smart_ds.start()          # start background replacement thread
+
+for epoch in range(num_epochs):
+    smart_ds.update_cache()  # swap in new items before each epoch
+    for batch in DataLoader(smart_ds, batch_size=2):
+        # training step ...
+        pass
+
+smart_ds.shutdown()       # stop background thread when done
+```
+
+The cache window advances like a circular buffer:
+
+```
+Dataset:  [img1, img2, img3, img4, img5]  (cache_num=4, replace_rate=0.25 → R=1)
+Epoch 1:  cache = [img1, img2, img3, img4]
+Epoch 2:  cache = [img2, img3, img4, img5]
+Epoch 3:  cache = [img3, img4, img5, img1]
+```
+
+<Note>
+If you use MONAI's workflow engine, add `SmartCacheHandler` to your trainer's handler list. It calls `start()`, `update_cache()`, and `shutdown()` automatically.
+</Note>
+
+## Predefined datasets
+
+MONAI provides ready-to-use dataset classes for common public benchmarks. They handle downloading, extraction, and train/validation splits.
+
+<Tabs>
+  <Tab title="DecathlonDataset">
+    ```python
+    from monai.data import DataLoader
+    from monai.apps import DecathlonDataset
+
+    train_ds = DecathlonDataset(
+        root_dir="./data",
+        task="Task09_Spleen",
+        section="training",      # "training" or "validation"
+        download=True,
+        transform=transforms,
+        cache_rate=1.0,
+        num_workers=4,
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=4)
+    print(f"Training samples: {len(train_ds)}")
+    ```
+
+    Available tasks include `Task01_BrainTumour`, `Task02_Heart`, `Task03_Liver`,
+    `Task04_Hippocampus`, `Task05_Prostate`, `Task06_Lung`, `Task07_Pancreas`,
+    `Task08_HepaticVessel`, `Task09_Spleen`, `Task10_Colon`.
+  </Tab>
+  <Tab title="MedNISTDataset">
+    ```python
+    from monai.apps import MedNISTDataset
+
+    train_ds = MedNISTDataset(
+        root_dir="./data",
+        section="training",
+        download=True,
+        transform=transforms,
+    )
+
+    # Each item has keys: "image" (file path) and "label" (class index, 0–5)
+    # Classes: AbdomenCT, BreastMRI, ChestCT, CXR, Hand, HeadCT
+    print(f"Classes: {train_ds.class_names}")
+    ```
+  </Tab>
+</Tabs>
+
+## ThreadDataLoader vs DataLoader
+
+MONAI provides two data loading classes:
+
+| | `DataLoader` | `ThreadDataLoader` |
+|--|--|--|
+| Workers | Separate processes | Separate threads |
+| Best when | Heavy transforms or large data | Lightweight transforms, all data in RAM |
+| Overhead | Higher IPC cost | Minimal IPC cost |
+| GPU pipeline | Standard | Can keep GPU busy with minimal gap |
+
+`ThreadDataLoader` is particularly effective when you are using `CacheDataset` with `cache_rate=1.0` — the cached data is already in RAM and only cheap random transforms remain, so thread-based loading avoids the process forking overhead of the standard `DataLoader`.
+
+```python
+from monai.data import ThreadDataLoader
+
+# Use with CacheDataset for maximum training throughput
+train_loader = ThreadDataLoader(
+    train_ds,
+    num_workers=4,
+    batch_size=4,
+    shuffle=True,
+    buffer_size=8,   # number of batches to prefetch
+)
+```
+
+## Cross-validation with partition_dataset
+
+`partition_dataset` splits a data list into K equal folds, making it straightforward to set up K-fold cross-validation.
+
+```python
+from monai.data import partition_dataset, CacheDataset, DataLoader
+
+# Split into 5 folds
+folds = partition_dataset(
+    data=data_dicts,
+    num_partitions=5,
+    shuffle=True,
+    seed=42,
+)
+
+# Fold 0: use partition 0 as validation, rest as training
+val_fold = 0
+train_data = sum([folds[i] for i in range(5) if i != val_fold], [])
+val_data = folds[val_fold]
+
+train_ds = CacheDataset(data=train_data, transform=train_transforms, cache_rate=1.0)
+val_ds = CacheDataset(data=val_data, transform=val_transforms, cache_rate=1.0)
+```
+
+Use `partition_dataset_classes` when your data has class labels and you want stratified folds:
+
+```python
+from monai.data import partition_dataset_classes
+
+stratified_folds = partition_dataset_classes(
+    data=data_dicts,
+    classes=[d["label"] for d in data_dicts],
+    num_partitions=5,
+    shuffle=True,
+)
+```
+
+## ZipDataset and PatchDataset
+
+**`ZipDataset`** combines multiple independent data sources into paired samples:
+
+```python
+from monai.data import ZipDataset, Dataset
+
+image_ds = Dataset(data=image_paths, transform=image_transforms)
+label_ds = Dataset(data=label_paths, transform=label_transforms)
+
+combined_ds = ZipDataset([image_ds, label_ds])
+# Each item is a tuple: (image_tensor, label_tensor)
+```
+
+**`PatchDataset`** handles hierarchical patch-based workflows where a sampler generates patches from each image:
+
+```python
+from monai.data import PatchDataset, PatchIter
+
+patch_iter = PatchIter(patch_size=(64, 64, 64), start_pos=(0, 0, 0))
+
+patch_ds = PatchDataset(
+    dataset=image_ds,
+    patch_func=patch_iter,
+    samples_per_image=4,
+    transform=patch_transforms,
+)
+```

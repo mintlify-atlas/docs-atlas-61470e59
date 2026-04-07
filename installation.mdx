@@ -1,0 +1,217 @@
+---
+title: "Installation"
+description: "Install MONAI via pip, conda, Docker, or from source. Core installation requires only Python 3.9+ and PyTorch."
+---
+
+## Prerequisites
+
+Before installing MONAI, make sure your environment meets the following requirements:
+
+| Requirement | Version |
+| --- | --- |
+| Python | >= 3.9 |
+| PyTorch | >= 2.4.1 |
+| NumPy | >= 1.24, < 3.0 |
+
+<Note>
+  The installation commands below install the CPU-only variant of PyTorch by default. To use GPU acceleration, install a CUDA-enabled PyTorch build first. See [GPU setup](#gpu-and-cuda-setup) below.
+</Note>
+
+## Install MONAI
+
+<Steps>
+  <Step title="Choose your installation method">
+    Select the tab that matches your environment. For most users, `pip install monai` is the fastest path.
+
+    <Tabs>
+      <Tab title="pip (stable)">
+        Install the current milestone release from PyPI:
+
+        ```bash
+        pip install monai
+        ```
+      </Tab>
+      <Tab title="pip (weekly preview)">
+        Install the weekly preview build, released every Sunday with the latest development changes:
+
+        ```bash
+        pip install monai-weekly
+        ```
+
+        <Warning>
+          Do not install both `monai` and `monai-weekly` in the same environment. This causes namespace conflicts and `ImportError`. Uninstall the existing package before switching:
+
+          ```bash
+          pip uninstall -y monai monai-weekly
+          ```
+        </Warning>
+      </Tab>
+      <Tab title="conda">
+        Install from the `conda-forge` channel:
+
+        ```bash
+        conda install -c conda-forge monai
+        ```
+      </Tab>
+      <Tab title="Docker">
+        Pull and run the official MONAI image from Docker Hub. Requires NVIDIA driver and Docker 19.03+.
+
+        ```bash
+        docker run --gpus all --rm -ti --ipc=host projectmonai/monai:latest
+        ```
+
+        To run a specific milestone release, use the version tag:
+
+        ```bash
+        docker run --gpus all --rm -ti --ipc=host projectmonai/monai:1.4.0
+        ```
+
+        <Note>
+          You do not need to install the CUDA toolkit on the host machine, but the NVIDIA driver must be installed. See [nvidia-docker](https://github.com/NVIDIA/nvidia-docker) for setup instructions.
+        </Note>
+      </Tab>
+      <Tab title="From source">
+        Clone the repository and install in editable mode for development or to access the latest unreleased changes:
+
+        ```bash
+        git clone https://github.com/Project-MONAI/MONAI.git
+        cd MONAI/
+        pip install -e .
+        ```
+
+        To build MONAI's optional C++/CUDA extensions (experimental):
+
+        ```bash
+        cd MONAI/
+        BUILD_MONAI=1 pip install -e .
+        ```
+
+        <Note>
+          Building C++/CUDA extensions requires [Ninja](https://ninja-build.org/) and the [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit). The extensions are built automatically when `torch.cuda.is_available()` is true. Set `FORCE_CUDA=1` to override.
+        </Note>
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Validate the installation">
+    Confirm that MONAI installed correctly by running:
+
+    ```bash
+    python -c "import monai; monai.config.print_config()"
+    ```
+
+    A successful install prints a summary of the MONAI version, Python version, PyTorch version, and optional dependency status:
+
+    ```
+    MONAI version: 1.4.0
+    Numpy version: 1.26.4
+    Pytorch version: 2.4.1
+    ...
+    ```
+
+    To check the installed version only:
+
+    ```bash
+    python -c "import monai; print(monai.__version__)"
+    ```
+  </Step>
+
+  <Step title="Install optional dependencies">
+    By default, MONAI installs only its required dependencies (PyTorch and NumPy). Many features require additional packages.
+
+    Use the extras syntax to install specific optional dependencies alongside MONAI:
+
+    <CodeGroup>
+
+    ```bash nibabel and scikit-image
+    pip install 'monai[nibabel,skimage]'
+    ```
+
+    ```bash ITK and DICOM support
+    pip install 'monai[itk,pydicom]'
+    ```
+
+    ```bash Workflow engines and logging
+    pip install 'monai[ignite,tensorboard,mlflow]'
+    ```
+
+    ```bash All optional dependencies
+    pip install 'monai[all]'
+    ```
+
+    </CodeGroup>
+
+    <Tip>
+      For most segmentation workflows, `pip install 'monai[nibabel,tqdm]'` provides NIfTI file support and progress bars with minimal extra dependencies.
+    </Tip>
+
+    #### Available extras
+
+    | Extra key | Installs | Use case |
+    | --- | --- | --- |
+    | `nibabel` | nibabel | Read/write NIfTI and Analyze files |
+    | `skimage` | scikit-image >= 0.14.2 | Additional image processing operations |
+    | `scipy` | scipy >= 1.12.0 | Spatial transforms and signal processing |
+    | `pillow` | pillow | PNG, JPEG, and other 2D image formats |
+    | `itk` | itk >= 5.2 | Advanced image I/O and registration |
+    | `pydicom` | pydicom | DICOM file reading and writing |
+    | `ignite` | pytorch-ignite == 0.4.11 | Event-driven training engines |
+    | `torchvision` | torchvision | Additional transforms and pretrained encoders |
+    | `tensorboard` | tensorboard | TensorBoard training visualization |
+    | `mlflow` | mlflow >= 2.12.2 | Experiment tracking with MLflow |
+    | `tqdm` | tqdm >= 4.47.0 | Progress bars during training |
+    | `pandas` | pandas | CSV-based dataset metadata handling |
+    | `einops` | einops | Tensor rearrangement for transformer models |
+    | `h5py` | h5py | HDF5 file format support |
+    | `zarr` | zarr | Chunked N-dimensional array storage |
+    | `onnx` | onnx, onnxruntime | Export and run models in ONNX format |
+    | `huggingface_hub` | huggingface_hub | Download models from the Hugging Face Hub |
+    | `all` | All of the above | Full feature set |
+  </Step>
+</Steps>
+
+## GPU and CUDA setup
+
+MONAI runs on CPU by default. For GPU-accelerated training on NVIDIA hardware:
+
+1. Install the latest [NVIDIA driver](https://www.nvidia.com/drivers) for your GPU.
+2. Check the [PyTorch installation guide](https://pytorch.org/get-started/locally/) for the recommended CUDA version that matches your driver.
+3. Install PyTorch with the appropriate CUDA build from the PyTorch website.
+4. Install MONAI using any of the methods above — it will automatically detect and use the GPU-enabled PyTorch.
+
+<Warning>
+  Do not install MONAI before installing the GPU-enabled PyTorch build. The MONAI package does not manage the CUDA variant of PyTorch and will use whichever `torch` is already installed.
+</Warning>
+
+Verify that PyTorch can see your GPU before running any MONAI training:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+```
+
+## MONAI version string
+
+The version string reflects the state of your installation:
+
+```
+MONAI version: 0.1.0+144.g52c763d.dirty
+```
+
+| Part | Meaning |
+| --- | --- |
+| `0.1.0` | Base milestone release |
+| `+144` | Number of commits ahead of the milestone |
+| `g52c763d` | Short git commit hash |
+| `dirty` | Local uncommitted changes present |
+
+A clean milestone install shows only the version number, for example `1.4.0`.
+
+## Uninstall
+
+To remove MONAI from your environment:
+
+```bash
+pip uninstall -y monai
+# or, for the weekly preview
+pip uninstall -y monai-weekly
+```

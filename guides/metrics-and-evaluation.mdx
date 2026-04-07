@@ -1,0 +1,420 @@
+---
+title: "Metrics and evaluation"
+description: "Compute segmentation, detection, and classification metrics with MONAI's CumulativeIterationMetric classes, including Dice, Hausdorff distance, surface distance, IoU, ROC-AUC, and confusion matrix."
+keywords: ["metrics", "Dice", "Hausdorff", "surface distance", "IoU", "ROC AUC", "confusion matrix", "evaluation"]
+---
+
+## Overview
+
+All metrics in `monai.metrics` extend `CumulativeIterationMetric`. This base class accumulates
+per-iteration results in an internal buffer and computes the final aggregate value on demand.
+
+```
+CumulativeIterationMetric
+  ├── DiceMetric
+  ├── HausdorffDistanceMetric
+  ├── SurfaceDistanceMetric
+  ├── MeanIoU
+  ├── ROCAUCMetric
+  ├── ConfusionMatrixMetric
+  ├── SurfaceDiceMetric
+  ├── GeneralizedDiceScore
+  ├── FIDMetric
+  └── ... (many more)
+```
+
+### compute() vs aggregate()
+
+<Tabs>
+  <Tab title="compute()">
+    Called once per iteration (or batch). Passes `y_pred` and `y` through `_compute_tensor`,
+    and appends the result to the buffer. Does **not** return a final score.
+
+    ```python
+    # inside your evaluation loop:
+    dice_metric(y_pred=pred_batch, y=label_batch)   # __call__ → compute()
+    ```
+  </Tab>
+  <Tab title="aggregate()">
+    Called once after the full epoch to reduce the buffer into a final scalar or tensor.
+    Resets the buffer automatically (or call `metric.reset()` manually).
+
+    ```python
+    # after iterating the full validation set:
+    mean_dice = dice_metric.aggregate().item()
+    dice_metric.reset()
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The `aggregate()` method accepts an optional `reduction` argument that overrides the instance-level
+  default. Available modes: `"none"`, `"mean"`, `"sum"`, `"mean_batch"`, `"sum_batch"`,
+  `"mean_channel"`, `"sum_channel"`.
+</Note>
+
+---
+
+## DiceMetric
+
+Computes the Sørensen–Dice coefficient between binary or one-hot segmentation tensors.
+
+### Constructor arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `include_background` | `bool` | `True` | Whether to include channel 0 (by convention the background class) in the Dice computation. Set to `False` to exclude it. |
+| `reduction` | `str` | `"mean"` | How to reduce per-class, per-sample scores into a single value. |
+| `get_not_nans` | `bool` | `False` | If `True`, `aggregate()` returns `(metric, not_nans)` where `not_nans` counts valid (non-NaN) values. |
+| `ignore_empty` | `bool` | `True` | If `True`, samples where the ground truth is empty yield `NaN` instead of 0 or 1. |
+| `num_classes` | `int \| None` | `None` | Required when `y_pred` and `y` are single-channel label maps rather than one-hot tensors. |
+| `return_with_label` | `bool \| list[str]` | `False` | Return a dict keyed by label name when `reduction="mean_batch"`. |
+
+### Example
+
+```python
+import torch
+from monai.metrics import DiceMetric
+
+dice_metric = DiceMetric(include_background=False, reduction="mean")
+
+# Simulate a 5-class segmentation batch: B=2, C=5, spatial=128×128×64
+y_pred = torch.rand(2, 5, 128, 128, 64)
+y_pred = torch.argmax(y_pred, dim=1, keepdim=True)          # [B, 1, H, W, D]
+y      = torch.randint(0, 5, (2, 1, 128, 128, 64))
+
+# Accumulate over the validation set
+dice_metric(y_pred=y_pred, y=y)   # can call in a loop
+
+# After all batches
+mean_dice = dice_metric.aggregate().item()
+dice_metric.reset()
+print(f"Mean Dice (excluding background): {mean_dice:.4f}")
+```
+
+### get_not_nans
+
+When `ignore_empty=True`, samples with no foreground voxels produce `NaN`. `get_not_nans=True`
+returns the count of valid values so you can check how many samples actually contributed.
+
+```python
+dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=True)
+dice_metric(y_pred=y_pred, y=y)
+mean_dice, not_nans = dice_metric.aggregate()
+print(f"Dice={mean_dice:.4f} computed over {not_nans.item()} valid samples")
+```
+
+---
+
+## HausdorffDistanceMetric
+
+Computes the Hausdorff Distance between predicted and ground-truth binary masks.
+Both `y_pred` and `y` must be **binarised** and in one-hot format (BCHW[D]).
+
+### Constructor arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `include_background` | `bool` | `False` | Include channel 0 (background). Defaults to `False`. |
+| `distance_metric` | `str` | `"euclidean"` | Surface distance metric: `"euclidean"`, `"chessboard"`, or `"taxicab"`. |
+| `percentile` | `float \| None` | `None` | If set, computes the N-th percentile Hausdorff Distance. Set to `95` for HD95. |
+| `directed` | `bool` | `False` | Compute directed (one-way) rather than symmetric Hausdorff Distance. |
+| `reduction` | `str` | `"mean"` | Reduction mode for the aggregated result. |
+| `get_not_nans` | `bool` | `False` | Return not-NaN count alongside the metric. |
+
+### HD95
+
+The 95th-percentile Hausdorff Distance is more robust to outliers than the maximum HD and is the
+standard metric in many medical image segmentation challenges.
+
+```python
+from monai.metrics import HausdorffDistanceMetric
+
+hd95_metric = HausdorffDistanceMetric(
+    include_background=False,
+    distance_metric="euclidean",
+    percentile=95,
+    reduction="mean",
+)
+
+# y_pred and y must be one-hot and binarised
+hd95_metric(y_pred=pred_onehot, y=label_onehot)
+hd95 = hd95_metric.aggregate().item()
+hd95_metric.reset()
+print(f"HD95: {hd95:.2f} mm")
+```
+
+<Warning>
+  Pass voxel `spacing` to `_compute_tensor` (or the `__call__`) so distances are measured in
+  physical units (mm) rather than voxels. Otherwise MONAI assumes isotropic unit spacing.
+
+  ```python
+  hd95_metric(y_pred=pred, y=label, spacing=(1.5, 1.5, 2.0))
+  ```
+</Warning>
+
+---
+
+## SurfaceDistanceMetric
+
+Computes the average symmetric surface distance (ASD) between two binary surfaces.
+
+```python
+from monai.metrics import SurfaceDistanceMetric
+
+asd_metric = SurfaceDistanceMetric(
+    include_background=False,
+    distance_metric="euclidean",
+    reduction="mean",
+    symmetric=True,   # average both directions
+)
+
+asd_metric(y_pred=pred_onehot, y=label_onehot)
+asd = asd_metric.aggregate().item()
+asd_metric.reset()
+```
+
+---
+
+## MeanIoU
+
+Computes the mean Intersection over Union (Jaccard index) across classes.
+
+```python
+from monai.metrics import MeanIoU
+
+iou_metric = MeanIoU(include_background=False, reduction="mean")
+
+iou_metric(y_pred=pred_onehot, y=label_onehot)
+mean_iou = iou_metric.aggregate().item()
+iou_metric.reset()
+```
+
+---
+
+## ROCAUCMetric
+
+Computes the area under the receiver operating characteristic curve for classification tasks.
+
+### The `average` parameter
+
+| Value | Description |
+|---|---|
+| `"macro"` | Compute AUC per class, then take the unweighted mean. Each class contributes equally. |
+| `"weighted"` | Per-class AUC weighted by the number of true instances in each class. |
+| `"micro"` | Compute AUC from the globally aggregated true-positive and false-positive rates. |
+
+```python
+from monai.metrics import ROCAUCMetric
+from monai.data import decollate_batch
+from monai.transforms import Activations, AsDiscrete
+
+roc_auc = ROCAUCMetric(average="macro")
+
+# For classification: y_pred is [B, num_classes] logits, y is [B] class indices
+act = Activations(softmax=True)
+to_onehot = AsDiscrete(to_onehot=num_classes)
+
+for batch in val_loader:
+    pred = model(batch["image"].to(device))
+    pred = [act(p) for p in decollate_batch(pred)]
+    label = [to_onehot(l) for l in decollate_batch(batch["label"])]
+    roc_auc(y_pred=pred, y=label)
+
+auc_score = roc_auc.aggregate()
+roc_auc.reset()
+print(f"Macro-averaged AUC: {auc_score:.4f}")
+```
+
+---
+
+## ConfusionMatrixMetric
+
+Derives a variety of confusion-matrix-based metrics from a single computation pass.
+
+### The `metric_name` parameter
+
+Pass one or more metric names as a string or list to `metric_name`:
+
+- `"sensitivity"` / `"recall"` / `"tpr"`
+- `"specificity"` / `"tnr"`
+- `"precision"` / `"ppv"`
+- `"negative predictive value"` / `"npv"`
+- `"miss rate"` / `"fnr"`
+- `"fall out"` / `"fpr"`
+- `"false discovery rate"` / `"fdr"`
+- `"false omission rate"` / `"for"`
+- `"prevalence threshold"` / `"pt"`
+- `"threat score"` / `"ts"` / `"critical success index"` / `"csi"`
+- `"accuracy"` / `"acc"`
+- `"balanced accuracy"` / `"ba"`
+- `"f1 score"` / `"f1"` / `"dsc"`
+- `"matthews correlation coefficient"` / `"mcc"`
+
+```python
+from monai.metrics import ConfusionMatrixMetric
+
+cm_metric = ConfusionMatrixMetric(
+    include_background=False,
+    metric_name=["sensitivity", "specificity", "precision"],
+    reduction="mean",
+)
+
+cm_metric(y_pred=pred_onehot, y=label_onehot)
+results = cm_metric.aggregate()   # list of tensors, one per metric name
+sensitivity, specificity, precision = [r.item() for r in results]
+cm_metric.reset()
+```
+
+---
+
+## Multi-processing metric computation
+
+For large datasets, MONAI metrics can be computed in parallel across multiple processes using
+standard Python multiprocessing or PyTorch distributed. The `Cumulative` base class supports
+`generate_data` and `merge` to coordinate buffer accumulation across workers.
+
+```python
+import torch.multiprocessing as mp
+from monai.metrics import DiceMetric
+
+def compute_on_worker(rank, data_slice):
+    """Each worker computes metrics on its data slice."""
+    metric = DiceMetric(include_background=False, reduction="mean")
+    for y_pred, y in data_slice:
+        metric(y_pred=y_pred, y=y)
+    # Return the raw buffer, not the aggregate
+    return metric.get_buffer()
+
+# Collect buffers from all workers and aggregate centrally
+buffers = [compute_on_worker(rank, slice_) for rank, slice_ in enumerate(data_slices)]
+combined = torch.cat(buffers, dim=0)
+
+metric = DiceMetric(include_background=False, reduction="mean")
+metric.extend(combined)  # inject the combined buffer
+final_dice = metric.aggregate().item()
+```
+
+---
+
+## MetricsSaver handler
+
+`MetricsSaver` writes a per-sample and summary metric report to CSV files at the end of evaluation.
+
+```python
+from monai.handlers import MetricsSaver
+
+saver = MetricsSaver(
+    save_dir="./metric_reports",
+    metric_details="val_mean_dice",   # key_val_metric name to dump per-sample details
+    batch_transform=lambda x: x["image_meta_dict"]["filename_or_obj"],  # row labels
+    summary_ops=["mean", "median", "max", "min", "5percentile", "95percentile", "std"],
+)
+```
+
+The handler attaches to the evaluator and writes:
+
+- `metric_details.csv` — one row per sample, one column per class.
+- `metrics_summary.csv` — summary statistics across all samples.
+
+---
+
+## Full working evaluation loop
+
+```python
+import torch
+from torch.utils.data import DataLoader
+from monai.data import CacheDataset, decollate_batch
+from monai.handlers import MeanDice, MetricsSaver, StatsHandler, from_engine
+from monai.inferers import SlidingWindowInferer
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
+from monai.networks.nets import UNet
+from monai.transforms import (
+    Activationsd, AsDiscreted, Compose,
+    EnsureChannelFirstd, LoadImaged, NormalizeIntensityd,
+    Orientationd, Spacingd,
+)
+from monai.engines import SupervisedEvaluator
+
+device = torch.device("cuda:0")
+
+# ── Load a trained model ─────────────────────────────────────────────────────
+model = UNet(spatial_dims=3, in_channels=1, out_channels=2,
+             channels=(16, 32, 64, 128, 256), strides=(2, 2, 2, 2)).to(device)
+model.load_state_dict(torch.load("best_model.pth"))
+
+# ── Validation dataset ───────────────────────────────────────────────────────
+val_transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+    NormalizeIntensityd(keys="image"),
+])
+val_ds = CacheDataset(data=val_data_dicts, transform=val_transforms, cache_rate=1.0)
+val_loader = DataLoader(val_ds, batch_size=1, num_workers=4)
+
+# ── Post-processing ──────────────────────────────────────────────────────────
+post_transforms = Compose([
+    Activationsd(keys="pred", softmax=True),
+    AsDiscreted(keys=["pred", "label"], argmax=[True, False], to_onehot=2),
+])
+
+# ── Metric objects ───────────────────────────────────────────────────────────
+dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=True)
+hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+
+# ── Evaluator ────────────────────────────────────────────────────────────────
+evaluator = SupervisedEvaluator(
+    device=device,
+    val_data_loader=val_loader,
+    network=model,
+    inferer=SlidingWindowInferer(roi_size=(96, 96, 64), sw_batch_size=4, overlap=0.5),
+    postprocessing=post_transforms,
+    key_val_metric={
+        "val_mean_dice": MeanDice(
+            include_background=False,
+            output_transform=from_engine(["pred", "label"]),
+        )
+    },
+    val_handlers=[
+        StatsHandler(output_transform=lambda x: None),
+        MetricsSaver(
+            save_dir="./metric_reports",
+            metric_details="val_mean_dice",
+            batch_transform=from_engine(["image_meta_dict"]),
+            summary_ops=["mean", "median", "std", "95percentile"],
+        ),
+    ],
+    amp=True,
+)
+
+evaluator.run()
+
+# ── Manual metric computation (outside engine) ───────────────────────────────
+model.eval()
+with torch.no_grad():
+    for batch in val_loader:
+        inputs  = batch["image"].to(device)
+        labels  = batch["label"].to(device)
+        outputs = SlidingWindowInferer(roi_size=(96, 96, 64), sw_batch_size=4)(inputs, model)
+
+        # decollate and apply postprocessing
+        batch_data = [{"pred": p, "label": l}
+                      for p, l in zip(decollate_batch(outputs), decollate_batch(labels))]
+        batch_data = [post_transforms(d) for d in batch_data]
+
+        preds  = torch.stack([d["pred"]   for d in batch_data])
+        labels = torch.stack([d["label"]  for d in batch_data])
+
+        dice_metric(y_pred=preds, y=labels)
+        hd95_metric(y_pred=preds, y=labels)
+
+mean_dice, not_nans = dice_metric.aggregate()
+hd95                 = hd95_metric.aggregate()
+dice_metric.reset()
+hd95_metric.reset()
+
+print(f"Mean Dice: {mean_dice:.4f}  (over {not_nans.item():.0f} valid samples)")
+print(f"HD95:      {hd95:.2f} voxels")
+```

@@ -1,0 +1,204 @@
+---
+title: "monai.utils"
+description: "Utility functions, enumerations, and helpers used throughout MONAI — including determinism control, optional imports, and common keys."
+---
+
+The `monai.utils` module provides cross-cutting utilities used throughout MONAI, including determinism control, optional dependency handling, common enumerations, and miscellaneous helpers.
+
+## Determinism
+
+### set_determinism
+
+Set global random seeds for reproducible training:
+
+```python
+from monai.utils import set_determinism
+
+set_determinism(seed=42)
+```
+
+<ParamField path="seed" type="int | None" required>
+  Random seed value. Pass `None` to reset to non-deterministic mode.
+</ParamField>
+<ParamField path="use_deterministic_algorithms" type="bool" default="False">
+  Call `torch.use_deterministic_algorithms(True)` for fully deterministic GPU ops. May raise errors for ops without deterministic implementations.
+</ParamField>
+<ParamField path="additional_settings" type="Sequence[Callable] | Callable | None">
+  Additional setter functions to call with the seed value.
+</ParamField>
+
+```python
+# Reset to non-deterministic
+set_determinism(seed=None)
+```
+
+## Optional Imports
+
+### optional_import
+
+Lazily import an optional dependency. Returns a placeholder that raises an `ImportError` only when actually used.
+
+```python
+from monai.utils import optional_import
+
+nib, has_nib = optional_import("nibabel")
+if has_nib:
+    img = nib.load("image.nii.gz")
+```
+
+### min_version
+
+Assert a minimum version of an installed package:
+
+```python
+from monai.utils import min_version
+
+min_version("nibabel", "3.2.1")  # raises ImportError if nibabel < 3.2.1
+```
+
+## Common Keys and Enumerations
+
+### CommonKeys
+
+Standard string constants for data dictionary keys used in transforms and engines:
+
+```python
+from monai.utils import CommonKeys
+
+# CommonKeys.IMAGE = "image"
+# CommonKeys.LABEL = "label"
+# CommonKeys.PRED  = "pred"
+# CommonKeys.LOSS  = "loss"
+# CommonKeys.INFO  = "info"
+```
+
+### MetaKeys
+
+Keys for metadata stored in `MetaTensor.meta`:
+
+```python
+from monai.utils import MetaKeys
+
+# MetaKeys.AFFINE         = "affine"
+# MetaKeys.ORIGINAL_AFFINE = "original_affine"
+# MetaKeys.SPACE          = "space"
+# MetaKeys.ORIGINAL_CHANNEL_DIM = "original_channel_dim"
+```
+
+### SpaceKeys
+
+Orientation string constants:
+
+```python
+from monai.utils import SpaceKeys
+
+# SpaceKeys.RAS = "RAS"
+# SpaceKeys.LPS = "LPS"
+```
+
+### BlendMode
+
+Blending modes for `SlidingWindowInferer`:
+
+```python
+from monai.utils import BlendMode
+
+# BlendMode.CONSTANT = "constant"
+# BlendMode.GAUSSIAN  = "gaussian"
+```
+
+### InterpolateMode / GridSampleMode
+
+Interpolation modes for spatial transforms:
+
+```python
+from monai.utils import InterpolateMode
+
+# InterpolateMode.NEAREST = "nearest"
+# InterpolateMode.LINEAR  = "linear"
+# InterpolateMode.BILINEAR = "bilinear"
+# InterpolateMode.TRILINEAR = "trilinear"
+```
+
+## Tuple Utilities
+
+### ensure_tuple
+
+Wrap a value in a tuple if it isn't already one:
+
+```python
+from monai.utils import ensure_tuple
+
+ensure_tuple(3)          # (3,)
+ensure_tuple((3, 3, 3))  # (3, 3, 3)
+ensure_tuple([1, 2])     # (1, 2)
+```
+
+### ensure_tuple_size
+
+Pad or truncate a tuple to a specific length:
+
+```python
+from monai.utils import ensure_tuple_size
+
+ensure_tuple_size(3, dim=3)        # (3, 3, 3)
+ensure_tuple_size((1, 2), dim=3)   # (1, 2, 2)  — repeats last element
+```
+
+### fall_back_tuple
+
+Use a fallback value where the primary tuple has `None`:
+
+```python
+from monai.utils import fall_back_tuple
+
+fall_back_tuple((None, 2, None), (1, 1, 1))  # (1, 2, 1)
+```
+
+## MONAIEnvVars
+
+Access MONAI-specific environment variables:
+
+```python
+from monai.utils import MONAIEnvVars
+
+MONAIEnvVars.debug()      # MONAI_DEBUG
+MONAIEnvVars.data_dir()   # MONAI_DATA_DIRECTORY
+```
+
+Set `MONAI_DATA_DIRECTORY` to control where datasets like `DecathlonDataset` are downloaded by default.
+
+## StrEnum
+
+Base class for string-valued enumerations used throughout MONAI:
+
+```python
+from monai.utils import StrEnum
+
+class MyMode(StrEnum):
+    FAST = "fast"
+    SLOW = "slow"
+```
+
+## PostFix
+
+Helper for constructing dictionary key suffixes used by dictionary-style transforms:
+
+```python
+from monai.utils import PostFix
+
+# PostFix.meta("image")     -> "image_meta_dict"
+# PostFix.orig_meta("image") -> "image_orig_meta_dict"
+```
+
+## RankFilter (logging)
+
+A `logging.Filter` that only emits log records on a specific distributed rank:
+
+```python
+import logging
+from monai.utils import RankFilter
+
+logger = logging.getLogger(__name__)
+logger.addFilter(RankFilter(rank=0))  # only log on rank 0
+```

@@ -1,0 +1,197 @@
+---
+title: "monai.bundle"
+description: "MONAI Bundle API — structured configuration-based model packaging, workflow execution, and model zoo integration."
+---
+
+The `monai.bundle` module provides tools for packaging models with structured JSON/YAML configs, running training and inference workflows, and interacting with the MONAI Model Zoo.
+
+## ConfigParser
+
+`ConfigParser` loads and resolves structured configuration files, enabling Python objects to be instantiated from JSON/YAML descriptions.
+
+```python
+from monai.bundle import ConfigParser
+
+parser = ConfigParser()
+parser.read_config("configs/train.json")
+
+# Override a parameter
+parser["network_def#in_channels"] = 2
+
+# Instantiate the network from config
+network = parser.get_parsed_content("network_def")
+```
+
+<ParamField path="config" type="dict | None">
+  Initial configuration dictionary. Can be updated after construction.
+</ParamField>
+<ParamField path="globals" type="dict | None">
+  Global variables available to all config expressions.
+</ParamField>
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `read_config(f)` | Load a JSON or YAML config file |
+| `get(id, default)` | Retrieve a raw config value by ID |
+| `get_parsed_content(id)` | Instantiate and return the object for a config ID |
+| `update(pairs)` | Update config values using `key#subkey` path syntax |
+| `parse(reset)` | Parse all config items and resolve references |
+
+## BundleWorkflow / ConfigWorkflow
+
+`BundleWorkflow` is the base class for running training and inference workflows defined in bundle configs.
+
+```python
+from monai.bundle import ConfigWorkflow
+
+workflow = ConfigWorkflow(
+    workflow_type="train",
+    config_file="configs/train.json",
+    logging_file="configs/logging.conf",
+    meta_file="configs/metadata.json",
+)
+workflow.initialize()
+workflow.run()
+workflow.finalize()
+```
+
+<ParamField path="workflow_type" type="str" required>
+  Either `"train"` or `"infer"`.
+</ParamField>
+<ParamField path="config_file" type="str | Sequence[str]" required>
+  Path(s) to JSON or YAML config file(s).
+</ParamField>
+<ParamField path="logging_file" type="str | None">
+  Path to Python logging config file.
+</ParamField>
+<ParamField path="meta_file" type="str | Sequence[str] | None">
+  Path(s) to metadata JSON file(s).
+</ParamField>
+
+## Bundle Scripts (CLI)
+
+Bundle scripts are accessible via Python and the command line.
+
+### `run` / `run_workflow`
+
+Run a bundle workflow from the command line:
+
+```bash
+python -m monai.bundle run \
+    --config_file configs/train.json \
+    --logging_file configs/logging.conf \
+    --meta_file configs/metadata.json
+```
+
+Or from Python:
+
+```python
+from monai.bundle import run
+run(config_file="configs/train.json", workflow_type="train")
+```
+
+### `download`
+
+Download a bundle from the MONAI Model Zoo:
+
+```bash
+python -m monai.bundle download \
+    --name spleen_ct_segmentation \
+    --version "0.5.3" \
+    --bundle_dir ./models
+```
+
+```python
+from monai.bundle import download
+download(name="spleen_ct_segmentation", bundle_dir="./models")
+```
+
+### `load`
+
+Load model weights from a downloaded bundle:
+
+```python
+from monai.bundle import load
+
+model = load(
+    name="spleen_ct_segmentation",
+    bundle_dir="./models",
+    net_override={"in_channels": 2},
+)
+```
+
+### `verify_metadata`
+
+Validate bundle metadata against the specification schema:
+
+```bash
+python -m monai.bundle verify_metadata --meta_file configs/metadata.json
+```
+
+### `verify_net_in_out`
+
+Check that the network accepts the expected input shapes:
+
+```bash
+python -m monai.bundle verify_net_in_out \
+    --net_id network_def \
+    --config_file configs/inference.json \
+    --meta_file configs/metadata.json
+```
+
+### `ckpt_export`
+
+Export model to TorchScript:
+
+```bash
+python -m monai.bundle ckpt_export \
+    --net_id network_def \
+    --filepath model.ts \
+    --ckpt_file models/model.pt \
+    --config_file configs/inference.json
+```
+
+### Other scripts
+
+| Function | Description |
+|----------|-------------|
+| `init_bundle(bundle_dir, ckpt_file, network, ...)` | Initialize a new bundle directory structure |
+| `get_all_bundles_list()` | List all bundles available in the Model Zoo |
+| `get_bundle_info(bundle_name, version)` | Get metadata for a specific bundle version |
+| `onnx_export(...)` | Export model to ONNX format |
+
+## Config Syntax
+
+Bundle configs use a special syntax for references and expressions:
+
+```json
+{
+  "lr": 0.001,
+  "optimizer": {
+    "_target_": "torch.optim.Adam",
+    "params": "$@network.parameters()",
+    "lr": "@lr"
+  },
+  "network": {
+    "_target_": "monai.networks.nets.UNet",
+    "spatial_dims": 3,
+    "in_channels": 1,
+    "out_channels": 2,
+    "channels": [16, 32, 64, 128, 256],
+    "strides": [2, 2, 2, 2]
+  }
+}
+```
+
+| Syntax | Meaning |
+|--------|---------|
+| `@id` | Reference to another config item |
+| `$expr` | Python expression evaluated at parse time |
+| `%macro%` | Macro substitution |
+| `_target_` | Python class to instantiate |
+
+<Tip>
+  Multiple config files can be merged by passing a list to `config_file`. Later files override earlier ones, making it easy to have a base config and an override config.
+</Tip>

@@ -1,0 +1,638 @@
+---
+title: 'monai.transforms'
+description: 'A comprehensive library of medical image transforms for loading, spatial manipulation, intensity normalization, and post-processing.'
+---
+
+The `monai.transforms` module provides a rich collection of image transformations designed for medical imaging pipelines. All transforms follow a consistent API: array-based transforms operate on tensors/arrays directly, while dictionary-based variants (suffixed `d` or `D`) operate on batches of named data items.
+
+<Note>
+Dictionary transforms (e.g., `LoadImaged`, `Resized`) are the standard for multi-modal pipelines where image and label must be transformed consistently. Array transforms (e.g., `LoadImage`, `Resize`) are used for single-tensor pipelines.
+</Note>
+
+## Compose & base classes
+
+### Compose
+
+Chains a sequence of callables into a single transform pipeline. Each transform must accept and return a single value (tensor, array, or dictionary).
+
+```python
+from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, Spacingd
+
+transform = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+])
+```
+
+<ParamField path="transforms" type="Sequence[Callable] | None">
+  Sequence of callables to chain. If a single callable is provided it is wrapped automatically.
+</ParamField>
+
+<ParamField path="map_items" type="bool | int" default="True">
+  If `True`, applies each transform to individual items when input is a list/tuple. Pass an integer to control the nesting depth.
+</ParamField>
+
+<ParamField path="unpack_items" type="bool" default="False">
+  If `True`, unpacks the input with `*` before passing to each callable.
+</ParamField>
+
+<ParamField path="lazy" type="bool | None" default="False">
+  Enable lazy evaluation. When `True`, compatible spatial transforms accumulate operations and resample only once at the end.
+</ParamField>
+
+<ParamField path="overrides" type="dict | None">
+  Parameter overrides applied to lazy transforms (e.g., `{"mode": "bilinear"}`). Only takes effect when lazy evaluation is active.
+</ParamField>
+
+**Related**: `OneOf`, `RandomOrder`, `SomeOf` — variants that apply a random subset or ordering of transforms.
+
+---
+
+### MapTransform
+
+Base class for all dictionary-based transforms. Subclass this when writing a custom transform that operates on named keys.
+
+```python
+from monai.transforms import MapTransform
+
+class MyTransform(MapTransform):
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            d[key] = process(d[key])
+        return d
+```
+
+<ParamField path="keys" type="KeysCollection" required>
+  Keys of the dictionary to transform.
+</ParamField>
+
+<ParamField path="allow_missing_keys" type="bool" default="False">
+  If `True`, silently skip keys that are absent from the data dictionary.
+</ParamField>
+
+---
+
+### Randomizable
+
+Mixin for transforms that contain stochastic behaviour. Provides `randomize()` and `set_random_state()` for reproducible pipelines.
+
+```python
+transform.set_random_state(seed=42)
+```
+
+---
+
+### InvertibleTransform
+
+Base class for transforms that support inversion via `inverse()`. Used to map predictions back to the original image space.
+
+```python
+data = transform(data)
+original = transform.inverse(data)
+```
+
+---
+
+## I/O transforms
+
+### LoadImage
+
+Loads an image from a file path into a `MetaTensor`, automatically reading affine, spacing, and other metadata.
+
+```python
+from monai.transforms import LoadImage
+
+loader = LoadImage(image_only=True)
+image = loader("ct_scan.nii.gz")  # returns MetaTensor
+```
+
+<ParamField path="reader" type="str | ImageReader | None">
+  Image reader to use. Defaults to auto-detection. Options: `"ITKReader"`, `"NibabelReader"`, `"PILReader"`, `"NumpyReader"`.
+</ParamField>
+
+<ParamField path="image_only" type="bool" default="False">
+  If `True`, return only the image array without the metadata dictionary.
+</ParamField>
+
+<ParamField path="dtype" type="np.dtype | None">
+  Convert the output array to this dtype.
+</ParamField>
+
+<ParamField path="ensure_channel_first" type="bool" default="False">
+  Automatically ensure a channel-first layout after loading.
+</ParamField>
+
+**Dictionary variant**: `LoadImaged(keys, reader, image_only, dtype, ensure_channel_first)`
+
+---
+
+### SaveImage
+
+Writes a tensor to disk in the specified format, restoring original affine metadata when available.
+
+```python
+from monai.transforms import SaveImage
+
+saver = SaveImage(output_dir="./output", output_postfix="pred", output_ext=".nii.gz")
+saver(prediction)
+```
+
+<ParamField path="output_dir" type="str | Path" default="./">
+  Directory to write output files.
+</ParamField>
+
+<ParamField path="output_postfix" type="str" default="trans">
+  String appended to the input filename before the extension.
+</ParamField>
+
+<ParamField path="output_ext" type="str" default=".nii.gz">
+  Output file extension. Determines the writer used.
+</ParamField>
+
+<ParamField path="resample" type="bool" default="True">
+  Resample back to original spacing and orientation using stored metadata before saving.
+</ParamField>
+
+**Dictionary variant**: `SaveImaged(keys, output_dir, output_postfix, output_ext, resample)`
+
+---
+
+## Spatial transforms
+
+### Resize
+
+Resizes an image to a target spatial size using interpolation.
+
+```python
+from monai.transforms import Resize
+
+resize = Resize(spatial_size=(128, 128, 64), mode="trilinear", anti_aliasing=True)
+```
+
+<ParamField path="spatial_size" type="Sequence[int] | int" required>
+  Target output size per spatial dimension.
+</ParamField>
+
+<ParamField path="size_mode" type="str" default="all">
+  `"all"` to resize all dimensions; `"longest"` to resize only the longest axis.
+</ParamField>
+
+<ParamField path="mode" type="str" default="area">
+  Interpolation mode. One of `"nearest"`, `"linear"`, `"bilinear"`, `"bicubic"`, `"trilinear"`, `"area"`.
+</ParamField>
+
+<ParamField path="anti_aliasing" type="bool" default="False">
+  Apply Gaussian smoothing before downsampling to reduce aliasing.
+</ParamField>
+
+**Dictionary variant**: `Resized(keys, spatial_size, mode)`
+
+---
+
+### Spacing
+
+Resamples an image to a target voxel spacing.
+
+```python
+from monai.transforms import Spacing
+
+resample = Spacing(pixdim=(1.0, 1.0, 1.0), mode="bilinear")
+```
+
+<ParamField path="pixdim" type="Sequence[float]" required>
+  Target voxel spacing in mm per dimension.
+</ParamField>
+
+<ParamField path="mode" type="str" default="bilinear">
+  Interpolation mode.
+</ParamField>
+
+<ParamField path="padding_mode" type="str" default="border">
+  Padding mode for out-of-bounds values.
+</ParamField>
+
+**Dictionary variant**: `Spacingd(keys, pixdim, mode, padding_mode)`
+
+---
+
+### RandAffine
+
+Applies random affine transformations (rotation, shear, scale, translation) with a given probability.
+
+```python
+from monai.transforms import RandAffine
+
+augment = RandAffine(
+    prob=0.5,
+    rotate_range=(0.3, 0.3, 0.3),
+    shear_range=(0.1, 0.1),
+    scale_range=(0.1, 0.1, 0.1),
+    mode="bilinear",
+)
+```
+
+<ParamField path="prob" type="float" default="0.1">
+  Probability of applying the transform.
+</ParamField>
+
+<ParamField path="rotate_range" type="Sequence[float] | None">
+  Range of rotation angles in radians per axis.
+</ParamField>
+
+<ParamField path="shear_range" type="Sequence[float] | None">
+  Range of shear values per axis pair.
+</ParamField>
+
+<ParamField path="translate_range" type="Sequence[float] | None">
+  Range of translation values per axis in pixels.
+</ParamField>
+
+<ParamField path="scale_range" type="Sequence[float] | None">
+  Range of scaling factors (relative to 1.0) per axis.
+</ParamField>
+
+<ParamField path="mode" type="str" default="bilinear">
+  Interpolation mode for resampling.
+</ParamField>
+
+**Dictionary variant**: `RandAffined(keys, prob, rotate_range, mode)`
+
+---
+
+### Flip / RandFlip
+
+Flips an image along one or more axes.
+
+```python
+from monai.transforms import Flip, RandFlip
+
+flip = Flip(spatial_axis=0)           # deterministic
+rand_flip = RandFlip(prob=0.5, spatial_axis=[0, 1])  # random
+```
+
+<ParamField path="spatial_axis" type="int | Sequence[int] | None">
+  Axis or axes along which to flip. `None` flips all axes.
+</ParamField>
+
+**Dictionary variants**: `Flipd`, `RandFlipd`
+
+---
+
+### Rotate / RandRotate
+
+Rotates an image by a fixed or random angle.
+
+```python
+from monai.transforms import Rotate, RandRotate
+
+rotate = Rotate(angle=0.785)   # 45 degrees in radians
+rand_r  = RandRotate(range_x=0.3, prob=0.5, keep_size=True)
+```
+
+<ParamField path="angle" type="float | Sequence[float]" required>
+  Rotation angle in radians.
+</ParamField>
+
+<ParamField path="keep_size" type="bool" default="True">
+  If `True`, pad or crop to keep the original image size.
+</ParamField>
+
+**Dictionary variants**: `Rotated`, `RandRotated`
+
+---
+
+### Zoom / RandZoom
+
+Zooms into or out of an image uniformly or per-axis.
+
+```python
+from monai.transforms import Zoom, RandZoom
+
+zoom = Zoom(zoom=1.2)
+rand_zoom = RandZoom(prob=0.5, min_zoom=0.9, max_zoom=1.1)
+```
+
+<ParamField path="zoom" type="float | Sequence[float]" required>
+  Zoom factor per spatial dimension.
+</ParamField>
+
+**Dictionary variants**: `Zoomd`, `RandZoomd`
+
+---
+
+### RandCropByPosNegLabel
+
+Randomly crops patches centered on positive or negative label regions, useful for segmentation tasks with small foreground structures.
+
+```python
+from monai.transforms import RandCropByPosNegLabel
+
+crop = RandCropByPosNegLabel(
+    spatial_size=(96, 96, 96),
+    label_key="label",
+    pos=1,
+    neg=1,
+    num_samples=4,
+    image_key="image",
+    image_threshold=0,
+)
+```
+
+<ParamField path="spatial_size" type="Sequence[int]" required>
+  Output patch size per spatial dimension.
+</ParamField>
+
+<ParamField path="label_key" type="str" required>
+  Key of the label array used to determine crop centers.
+</ParamField>
+
+<ParamField path="pos" type="float" default="1.0">
+  Ratio of positive (foreground) crop centers to sample.
+</ParamField>
+
+<ParamField path="neg" type="float" default="1.0">
+  Ratio of negative (background) crop centers to sample.
+</ParamField>
+
+<ParamField path="num_samples" type="int" default="1">
+  Number of patches to sample per image.
+</ParamField>
+
+**Dictionary variant**: `RandCropByPosNegLabeld`
+
+---
+
+### CropForeground
+
+Crops the image to the bounding box of the foreground (non-background) region.
+
+```python
+from monai.transforms import CropForeground
+
+crop = CropForeground(source_key="image", select_fn=lambda x: x > 0, margin=10)
+```
+
+<ParamField path="select_fn" type="Callable" default="is_positive">
+  Function to identify foreground voxels.
+</ParamField>
+
+<ParamField path="channel_indices" type="int | Sequence[int] | None">
+  Channels to use for foreground detection.
+</ParamField>
+
+<ParamField path="margin" type="int | Sequence[int]" default="0">
+  Padding margin added around the foreground bounding box.
+</ParamField>
+
+**Dictionary variant**: `CropForegroundd(keys, source_key, select_fn, margin)`
+
+---
+
+## Intensity transforms
+
+### ScaleIntensityRange
+
+Scales voxel intensities from a source range `[a_min, a_max]` to a target range `[b_min, b_max]`.
+
+```python
+from monai.transforms import ScaleIntensityRange
+
+scale = ScaleIntensityRange(a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True)
+```
+
+<ParamField path="a_min" type="float" required>
+  Minimum value of the source intensity range.
+</ParamField>
+
+<ParamField path="a_max" type="float" required>
+  Maximum value of the source intensity range.
+</ParamField>
+
+<ParamField path="b_min" type="float | None" default="0.0">
+  Minimum value of the target intensity range.
+</ParamField>
+
+<ParamField path="b_max" type="float | None" default="1.0">
+  Maximum value of the target intensity range.
+</ParamField>
+
+<ParamField path="clip" type="bool" default="False">
+  Clip intensities outside `[b_min, b_max]` after scaling.
+</ParamField>
+
+**Dictionary variant**: `ScaleIntensityRanged(keys, a_min, a_max, b_min, b_max, clip)`
+
+---
+
+### NormalizeIntensity
+
+Normalizes intensities to zero mean and unit standard deviation, or using explicit subtrahend/divisor values.
+
+```python
+from monai.transforms import NormalizeIntensity
+
+norm = NormalizeIntensity(nonzero=True, channel_wise=True)
+```
+
+<ParamField path="subtrahend" type="float | ndarray | None">
+  Value(s) to subtract. Defaults to the mean if `None`.
+</ParamField>
+
+<ParamField path="divisor" type="float | ndarray | None">
+  Value(s) to divide by. Defaults to the std if `None`.
+</ParamField>
+
+<ParamField path="nonzero" type="bool" default="False">
+  Compute statistics from nonzero voxels only.
+</ParamField>
+
+<ParamField path="channel_wise" type="bool" default="False">
+  Compute statistics independently per channel.
+</ParamField>
+
+**Dictionary variant**: `NormalizeIntensityd(keys, subtrahend, divisor, nonzero, channel_wise)`
+
+---
+
+### RandGaussianNoise
+
+Adds Gaussian noise with a random standard deviation.
+
+```python
+from monai.transforms import RandGaussianNoise
+
+noise = RandGaussianNoise(prob=0.1, mean=0.0, std=0.1)
+```
+
+<ParamField path="prob" type="float" default="0.1">
+  Probability of adding noise.
+</ParamField>
+
+<ParamField path="mean" type="float" default="0.0">
+  Mean of the Gaussian distribution.
+</ParamField>
+
+<ParamField path="std" type="float" default="0.1">
+  Standard deviation of the Gaussian distribution.
+</ParamField>
+
+**Dictionary variant**: `RandGaussianNoised(keys, prob, mean, std)`
+
+---
+
+### RandShiftIntensity
+
+Shifts voxel intensities by a uniformly sampled offset.
+
+```python
+from monai.transforms import RandShiftIntensity
+
+shift = RandShiftIntensity(offsets=0.1, prob=0.5)
+```
+
+<ParamField path="offsets" type="float | tuple[float, float]" required>
+  Range of the intensity shift. If a single value, the range is `[-offsets, offsets]`.
+</ParamField>
+
+<ParamField path="prob" type="float" default="0.1">
+  Probability of applying the shift.
+</ParamField>
+
+**Dictionary variant**: `RandShiftIntensityd(keys, offsets, prob)`
+
+---
+
+## Post-processing transforms
+
+### AsDiscrete
+
+Converts model output logits/probabilities to discrete class predictions.
+
+```python
+from monai.transforms import AsDiscrete
+
+post = AsDiscrete(argmax=True, to_onehot=5)         # multi-class
+post_binary = AsDiscrete(threshold=0.5)              # binary
+```
+
+<ParamField path="argmax" type="bool" default="False">
+  Apply argmax over the channel dimension to get class indices.
+</ParamField>
+
+<ParamField path="to_onehot" type="int | None">
+  Convert argmax result to one-hot encoding with this many classes.
+</ParamField>
+
+<ParamField path="threshold" type="float | None">
+  Threshold for binary prediction (applied after optional sigmoid).
+</ParamField>
+
+**Dictionary variant**: `AsDiscreted(keys, argmax, to_onehot, threshold)`
+
+---
+
+### KeepLargestConnectedComponent
+
+Retains only the `k` largest connected components in a binary or multi-class segmentation.
+
+```python
+from monai.transforms import KeepLargestConnectedComponent
+
+klcc = KeepLargestConnectedComponent(applied_labels=[1, 2], num_components=1)
+```
+
+<ParamField path="applied_labels" type="Sequence[int] | None">
+  Labels to process. If `None`, process all non-zero labels.
+</ParamField>
+
+<ParamField path="is_onehot" type="bool | None">
+  Indicate whether the input is one-hot encoded.
+</ParamField>
+
+<ParamField path="num_components" type="int" default="1">
+  Number of largest connected components to keep.
+</ParamField>
+
+**Dictionary variant**: `KeepLargestConnectedComponentd`
+
+---
+
+### Activations
+
+Applies activation functions (sigmoid, softmax, or other) to model outputs.
+
+```python
+from monai.transforms import Activations
+
+act = Activations(sigmoid=True)
+act_mc = Activations(softmax=True)
+```
+
+<ParamField path="sigmoid" type="bool" default="False">
+  Apply sigmoid activation.
+</ParamField>
+
+<ParamField path="softmax" type="bool" default="False">
+  Apply softmax activation over the channel dimension.
+</ParamField>
+
+<ParamField path="other" type="Callable | None">
+  Any other callable activation function.
+</ParamField>
+
+**Dictionary variant**: `Activationsd(keys, sigmoid, softmax, other)`
+
+---
+
+## Complete pipeline example
+
+```python
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
+    ScaleIntensityRanged,
+    CropForegroundd,
+    RandCropByPosNegLabeld,
+    RandAffined,
+    RandGaussianNoised,
+    EnsureTyped,
+)
+
+train_transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(
+        keys=["image", "label"],
+        pixdim=(1.5, 1.5, 2.0),
+        mode=("bilinear", "nearest"),
+    ),
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=-57, a_max=164,
+        b_min=0.0, b_max=1.0,
+        clip=True,
+    ),
+    CropForegroundd(keys=["image", "label"], source_key="image"),
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=(96, 96, 96),
+        pos=1, neg=1,
+        num_samples=4,
+    ),
+    RandAffined(
+        keys=["image", "label"],
+        prob=0.5,
+        rotate_range=(0.3, 0.3, 0.3),
+        mode=("bilinear", "nearest"),
+    ),
+    RandGaussianNoised(keys=["image"], prob=0.1, std=0.01),
+    EnsureTyped(keys=["image", "label"]),
+])
+```

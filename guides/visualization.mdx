@@ -1,0 +1,319 @@
+---
+title: 'Visualization'
+description: 'Visualize 3D volumes, segmentation overlays, class activation maps, and training metrics.'
+---
+
+MONAI provides several visualization utilities in `monai.visualize` for inspecting data, model outputs, and model behavior. These range from simple volume display helpers to gradient-based saliency maps and handler integrations for TensorBoard and MLflow.
+
+<CardGroup cols={2}>
+  <Card title="Volume display" icon="image">
+    `matshow3d` renders 3D volumes as a 2D grid of slices using matplotlib—useful for quick sanity checks.
+  </Card>
+  <Card title="Segmentation overlay" icon="object-group">
+    `blend_images` composites a label map onto a grayscale or RGB image with configurable transparency and colormap.
+  </Card>
+  <Card title="Class activation maps" icon="map">
+    `CAM`, `GradCAM`, and `GradCAMpp` highlight regions that drive a classification decision, for both 2D and 3D models.
+  </Card>
+  <Card title="Experiment tracking" icon="chart-bar">
+    `TensorBoardImageHandler`, `TensorBoardStatsHandler`, and `MLFlowHandler` log images and metrics during training with no boilerplate.
+  </Card>
+</CardGroup>
+
+## matshow3d
+
+`matshow3d` renders a 3D volume as a grid of 2D slice images using matplotlib. It is the quickest way to visually inspect a volumetric image or label.
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+from monai.visualize import matshow3d
+
+volume = np.random.rand(64, 64, 64)  # H × W × D
+
+fig = plt.figure(figsize=(12, 12))
+matshow3d(
+    volume=volume,
+    fig=fig,
+    title="Spleen CT",
+    every_n=4,         # display every 4th slice
+    frame_dim=-1,      # iterate along the last (depth) axis
+    cmap="gray",
+    show=True,
+)
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `volume` | array or list of arrays | required | 3D volume (`HWD`, `CHWD`, or `BCHWD`). A list of channel-first arrays is padded and concatenated. |
+| `fig` | `Figure` or `Axes` | `None` | Existing matplotlib figure or axes to draw into. A new figure is created if `None`. |
+| `title` | `str` | `None` | Title displayed above the grid. |
+| `figsize` | `(int, int)` | `(10, 10)` | Figure size in inches `(width, height)`. |
+| `every_n` | `int` | `1` | Subsample factor: display one slice every `n` slices. |
+| `frame_dim` | `int` | `-3` | Which axis to slice along. Use `-1` for depth, `-2` for height, `-3` for width. |
+| `channel_dim` | `int` or `None` | `None` | If set to `0` or `1`, treats that axis as RGB/RGBA channels for color display. |
+| `vmin` / `vmax` | `float` | `None` | Intensity window for the colormap. Defaults to the array min/max. |
+| `show` | `bool` | `False` | Call `plt.show()` after creating the figure. |
+| `cmap` | `str` | (matplotlib default) | Colormap name, e.g., `"gray"`, `"hot"`, `"viridis"`. |
+
+### Displaying a list of volumes
+
+Pass a list of channel-first arrays to display multiple volumes side by side. Arrays are padded to the same spatial size before concatenation.
+
+```python
+volumes = [np.random.rand(1, 64, 64, 64) for _ in range(4)]
+matshow3d(volumes, title="Batch of volumes", every_n=8, show=True)
+```
+
+## blend_images
+
+`blend_images` overlays a segmentation label map on an image, returning an RGB array you can display or save. Both inputs must have shape `C × H × W [× D]`.
+
+```python
+import torch
+from monai.visualize import blend_images
+
+# image: 1 × H × W × D (grayscale CT)
+# label: 1 × H × W × D (integer class indices)
+blended = blend_images(
+    image=image_tensor,
+    label=label_tensor,
+    alpha=0.5,
+    cmap="hsv",
+    rescale_arrays=True,
+)
+# blended shape: 3 × H × W × D (RGB)
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `image` | array or tensor | required | Input image with shape `CHW[D]`. Must have 1 or 3 channels. |
+| `label` | array or tensor | required | Label map with shape `1HW[D]`. |
+| `alpha` | `float` or array | `0.5` | Label opacity. `0` = invisible, `1` = fully opaque. Can be a spatial array matching image size for per-pixel weighting. |
+| `cmap` | `str` | `"hsv"` | Matplotlib colormap for mapping label values to colors. |
+| `rescale_arrays` | `bool` | `True` | Rescale image and label to `[0, 1]` before blending. |
+| `transparent_background` | `bool` | `True` | Set alpha to 0 wherever `label == 0` (background). |
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+from monai.visualize import blend_images, matshow3d
+
+# Display a single 2D slice of the blended output
+blended_np = blended.numpy()  # 3 × H × W × D
+slice_idx = blended_np.shape[-1] // 2
+plt.imshow(np.moveaxis(blended_np[..., slice_idx], 0, -1))
+plt.axis("off")
+plt.show()
+```
+
+## Class activation maps
+
+CAM-based methods produce spatial activation maps that highlight which regions of the input most influenced a classification decision. MONAI supports three methods, all working for 2D and 3D models.
+
+### CAM
+
+Standard class activation mapping. Requires the network to use global average pooling before the final classification layer.
+
+```python
+from monai.visualize import CAM
+
+cam = CAM(
+    nn_module=model,
+    target_layers="model.layer4",   # name of the target layer
+    upsampler=None,                 # defaults to bilinear upsampling
+)
+
+# Forward pass with a batch of images
+activation_map = cam(x=image_batch, class_idx=1)
+# activation_map: B × 1 × H × W [× D], values in [0, 1]
+```
+
+### GradCAM
+
+Gradient-weighted class activation mapping. Works with any architecture by computing gradients at the target layer. Preferable when the network does not use global average pooling.
+
+```python
+from monai.visualize import GradCAM
+
+grad_cam = GradCAM(
+    nn_module=model,
+    target_layers="model.layer4",
+)
+
+activation_map = grad_cam(x=image_batch, class_idx=0)
+```
+
+### GradCAMpp
+
+An improved version of GradCAM that weights gradients by their squared values, which can produce sharper and more accurate localization.
+
+```python
+from monai.visualize import GradCAMpp
+
+grad_campp = GradCAMpp(
+    nn_module=model,
+    target_layers="model.layer4",
+)
+
+activation_map = grad_campp(x=image_batch, class_idx=0)
+```
+
+### Parameters shared by CAM, GradCAM, GradCAMpp
+
+| Parameter | Description |
+|-----------|-------------|
+| `nn_module` | The PyTorch classification model to analyze. |
+| `target_layers` | Name (or list of names) of layers to hook. Identify layer names with `dict(model.named_modules()).keys()`. |
+| `upsampler` | Callable to upsample the activation map to input resolution. Defaults to `default_upsampler` (bilinear/trilinear). |
+
+### Full 3D GradCAM example
+
+```python
+import torch
+import matplotlib.pyplot as plt
+from monai.networks.nets import DenseNet121
+from monai.visualize import GradCAM, blend_images, matshow3d
+
+# Load a pretrained 3D classification model
+model = DenseNet121(spatial_dims=3, in_channels=1, out_channels=6)
+model.eval()
+
+# Input: 1 × 1 × 64 × 64 × 64
+image = torch.rand(1, 1, 64, 64, 64)
+
+# Compute GradCAM for predicted class
+grad_cam = GradCAM(nn_module=model, target_layers="class_layers.relu")
+cam_map = grad_cam(x=image, class_idx=None)  # class_idx=None uses argmax
+
+# Overlay the activation map on the input image
+blended = blend_images(image=image[0], label=cam_map[0], alpha=0.5, cmap="hot")
+
+# Visualize slices
+matshow3d(blended, frame_dim=-1, every_n=8, title="GradCAM", show=True)
+```
+
+<Note>
+Use `dict(model.named_modules()).keys()` to list all valid layer names for `target_layers`. Choosing a layer too early in the network produces coarse maps; choosing one too late may produce very small feature maps.
+</Note>
+
+## TensorBoard integration
+
+`TensorBoardImageHandler` and `TensorBoardStatsHandler` are Ignite-compatible event handlers that log data during training.
+
+### TensorBoardImageHandler
+
+Logs a batch of images, labels, or predictions at configurable intervals.
+
+```python
+from monai.handlers import TensorBoardImageHandler
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(log_dir="./runs/experiment1")
+
+tb_image_handler = TensorBoardImageHandler(
+    summary_writer=writer,
+    batch_transform=lambda batch: (batch["image"], batch["label"]),
+    output_transform=lambda output: output["pred"],
+    global_iter_transform=lambda engine: engine.state.epoch,
+    index=0,          # which image in the batch to log
+    max_channels=1,   # maximum channels to log
+    frame_dim=-1,     # which spatial dim to use as frame axis for 3D
+)
+```
+
+Attach the handler to your trainer or evaluator:
+
+```python
+trainer.add_event_handler(
+    Events.EPOCH_COMPLETED(every=5),
+    tb_image_handler,
+)
+```
+
+### TensorBoardStatsHandler
+
+Logs scalar metrics (loss, Dice, learning rate) at each iteration or epoch.
+
+```python
+from monai.handlers import TensorBoardStatsHandler
+
+tb_stats_handler = TensorBoardStatsHandler(
+    summary_writer=writer,
+    output_transform=lambda output: output["loss"],
+    tag_name="train_loss",
+)
+
+trainer.add_event_handler(
+    Events.ITERATION_COMPLETED,
+    tb_stats_handler,
+)
+```
+
+Launch TensorBoard to view logs:
+
+```bash
+tensorboard --logdir ./runs
+```
+
+## MLflow integration
+
+`MLFlowHandler` logs metrics, parameters, and artifacts to an MLflow tracking server. It is also available as a bundle-level integration via the `tracking="mlflow"` parameter on `ConfigWorkflow`.
+
+### Standalone handler
+
+```python
+from monai.handlers import MLFlowHandler
+
+mlflow_handler = MLFlowHandler(
+    tracking_uri="./mlruns",
+    experiment_name="spleen_segmentation",
+    run_name="run_001",
+    output_transform=lambda output: output["loss"],
+    tag_name="train_loss",
+    artifacts=["configs/train.json"],  # log config as artifact
+)
+
+trainer.add_event_handler(Events.ITERATION_COMPLETED, mlflow_handler)
+trainer.add_event_handler(Events.COMPLETED, mlflow_handler.close)
+```
+
+### Via bundle tracking
+
+The simplest way to enable MLflow for a bundle workflow:
+
+```python
+from monai.bundle import ConfigWorkflow
+
+workflow = ConfigWorkflow(
+    config_file="configs/train.json",
+    tracking="mlflow",
+    **{
+        "output_dir": "./eval",
+        "tracking_uri": "./mlruns",
+        "experiment_name": "spleen_seg",
+        "run_name": "experiment_001",
+    }
+)
+workflow.initialize()
+workflow.run()
+workflow.finalize()
+```
+
+Or from the CLI:
+
+```bash
+python -m monai.bundle run \
+  --config_file configs/train.json \
+  --tracking mlflow \
+  --output_dir ./eval \
+  --experiment_name spleen_seg
+```
+
+<Tip>
+When using the bundle `tracking` integration, the executed config JSON is saved as an MLflow artifact automatically, giving you a full record of the hyperparameters used in each run.
+</Tip>

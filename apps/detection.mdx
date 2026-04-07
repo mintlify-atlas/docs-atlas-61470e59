@@ -1,0 +1,398 @@
+---
+title: Detection
+description: 3D lesion detection and bounding box prediction with MONAI's RetinaNet-based detector, box transforms, FROC metrics, and an end-to-end setup example.
+---
+
+The `monai.apps.detection` subpackage provides a full 3-D object detection pipeline adapted from the 2-D RetinaNet architecture. It handles anchor generation, bounding-box encoding/decoding, hard-negative sampling, non-maximum suppression, and FROC evaluation — all in a single cohesive API.
+
+<CardGroup cols={2}>
+  <Card title="RetinaNetDetector" icon="crosshairs">
+    One-stage anchor-based detector with FPN backbone, supporting both 2-D and 3-D inputs
+  </Card>
+  <Card title="Box transforms" icon="vector-square">
+    Dictionary-style transforms that keep image and bounding-box coordinates in sync
+  </Card>
+  <Card title="COCOMetric / FROC" icon="chart-area">
+    Standard detection metrics including FROC for medical imaging evaluation
+  </Card>
+  <Card title="Hard negative sampler" icon="filter">
+    Balances positive and negative anchors during training for improved convergence
+  </Card>
+</CardGroup>
+
+---
+
+## monai.apps.detection subpackage overview
+
+```
+monai.apps.detection
+├── networks/
+│   ├── RetinaNet                       # backbone + FPN + classification/regression heads
+│   ├── RetinaNetDetector               # full detector with NMS and training losses
+│   └── retinanet_resnet50_fpn_detector # convenience factory function
+├── transforms/
+│   ├── ConvertBoxMode / ConvertBoxModed
+│   ├── FlipBoxd / RandFlipBoxd
+│   ├── ZoomBoxd / RandZoomBoxd
+│   ├── RandCropBoxByPosNegLabeld
+│   └── RotateBox90d / RandRotateBox90d
+├── metrics/
+│   └── COCOMetric
+└── utils/
+    ├── AnchorGenerator / AnchorGeneratorWithAnchorShape
+    ├── ATSSMatcher
+    ├── BoxCoder
+    ├── BoxSelector
+    └── HardNegativeSampler
+```
+
+---
+
+## Key classes
+
+### RetinaNetDetector
+
+The main detection class. It wraps a network with an `AnchorGenerator` and adds all the training and inference logic: anchor–target matching, regression loss, classification loss, and post-processing.
+
+```python
+from monai.apps.detection.networks.retinanet_detector import RetinaNetDetector
+from monai.apps.detection.utils.anchor_utils import AnchorGeneratorWithAnchorShape
+
+anchor_generator = AnchorGeneratorWithAnchorShape(
+    feature_map_scales=(1, 2, 4),
+    base_anchor_shapes=((6, 8, 4), (8, 6, 5), (10, 10, 6)),  # (H, W, D) in voxels
+)
+
+# network must expose: spatial_dims, num_classes, cls_key,
+# box_reg_key, num_anchors, size_divisible
+detector = RetinaNetDetector(
+    network=network,
+    anchor_generator=anchor_generator,
+)
+```
+
+During **training** the detector expects a list of target dicts:
+
+```python
+targets = [
+    {
+        "boxes":  torch.tensor([[x1, y1, z1, x2, y2, z2]]),  # xyzxyz StandardMode
+        "labels": torch.tensor([0]),
+    }
+]
+loss_dict = detector(images, targets)  # returns {"cls_loss": ..., "box_reg_loss": ...}
+```
+
+During **inference** it returns a list of prediction dicts:
+
+```python
+detector.eval()
+predictions = detector(images)
+# predictions[i]: {"boxes": Tensor[N,6], "labels": Tensor[N], "labels_scores": Tensor[N]}
+```
+
+<Note>
+Only `detector.network` contains trainable parameters. Save and load with `detector.network.state_dict()`.
+</Note>
+
+### retinanet_resnet50_fpn_detector
+
+A convenience factory that builds a `RetinaNetDetector` with a ResNet-50 + FPN backbone pre-trained on 23 medical datasets (optional).
+
+```python
+from monai.apps.detection.networks.retinanet_detector import retinanet_resnet50_fpn_detector
+from monai.apps.detection.utils.anchor_utils import AnchorGeneratorWithAnchorShape
+
+anchor_generator = AnchorGeneratorWithAnchorShape(
+    feature_map_scales=(1, 2),
+    base_anchor_shapes=((8, 8, 8),),
+)
+
+detector = retinanet_resnet50_fpn_detector(
+    num_classes=1,                  # lesion class (excluding background)
+    anchor_generator=anchor_generator,
+    returned_layers=[1, 2, 3],      # FPN levels
+    pretrained=False,               # set True to load Med3D weights
+    spatial_dims=3,
+    n_input_channels=1,
+    conv1_t_size=7,
+    conv1_t_stride=(2, 2, 2),
+)
+```
+
+### RetinaNet (backbone + heads)
+
+The underlying network. Use this directly when you want to swap in a custom feature extractor.
+
+```python
+from monai.apps.detection.networks.retinanet_network import RetinaNet
+
+network = RetinaNet(
+    spatial_dims=3,
+    num_classes=1,
+    num_anchors=3,
+    feature_extractor=my_fpn,
+    size_divisible=[32, 32, 32],
+)
+```
+
+### AnchorGeneratorWithAnchorShape
+
+Generates anchors from explicit shape lists rather than aspect-ratio / scale combinations — more natural for 3-D medical imaging where lesions have known typical sizes.
+
+```python
+from monai.apps.detection.utils.anchor_utils import AnchorGeneratorWithAnchorShape
+
+anchor_gen = AnchorGeneratorWithAnchorShape(
+    feature_map_scales=(1, 2, 4),      # one entry per FPN level
+    base_anchor_shapes=((6, 8, 4), (8, 6, 5), (10, 10, 6)),
+)
+```
+
+### COCOMetric
+
+Computes AP at multiple IoU thresholds, following the COCO evaluation protocol.
+
+```python
+from monai.apps.detection.metrics.coco import COCOMetric
+
+coco_metric = COCOMetric(
+    classes=["lesion"],
+    iou_list=(0.1, 0.5, 0.75),
+    iou_range=(0.1, 0.5, 0.05),
+    max_detection=(1, 10, 100),
+)
+```
+
+---
+
+## Detection transforms
+
+Box-aware transforms keep the bounding-box coordinates consistent with any spatial transformation applied to the image.
+
+<Tabs>
+  <Tab title="Array-style">
+    ```python
+    from monai.apps.detection.transforms.array import (
+        ConvertBoxMode,
+        ConvertBoxToStandardMode,
+        FlipBox,
+        ZoomBox,
+        ClipBoxToImage,
+    )
+    ```
+  </Tab>
+  <Tab title="Dictionary-style">
+    ```python
+    from monai.apps.detection.transforms.dictionary import (
+        ConvertBoxModed,
+        FlipBoxd,
+        RandFlipBoxd,
+        ZoomBoxd,
+        RandZoomBoxd,
+        RandCropBoxByPosNegLabeld,
+        RotateBox90d,
+        RandRotateBox90d,
+        ClipBoxToImaged,
+        BoxToMaskd,
+        MaskToBoxd,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### Example training transform pipeline
+
+```python
+from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityRanged
+from monai.apps.detection.transforms.dictionary import (
+    ConvertBoxModed,
+    RandCropBoxByPosNegLabeld,
+    RandFlipBoxd,
+    RandRotateBox90d,
+    ClipBoxToImaged,
+)
+
+train_transforms = Compose([
+    LoadImaged(keys=["image"], image_only=True),
+    EnsureChannelFirstd(keys=["image"]),
+    ScaleIntensityRanged(
+        keys=["image"], a_min=-1024, a_max=300, b_min=0.0, b_max=1.0, clip=True
+    ),
+    # convert boxes from xyxyxy to xyzxyz StandardMode if needed
+    ConvertBoxModed(box_keys=["boxes"], src_mode="xyzxyz", dst_mode="xyzxyz"),
+    RandCropBoxByPosNegLabeld(
+        image_keys=["image"],
+        box_keys="boxes",
+        label_keys="labels",
+        spatial_size=[192, 192, 80],
+        whole_box=True,
+        num_samples=2,
+        pos=1,
+        neg=1,
+    ),
+    RandFlipBoxd(
+        image_keys=["image"],
+        box_keys=["boxes"],
+        box_ref_image_keys="image",
+        prob=0.5,
+        spatial_axis=0,
+    ),
+    RandRotateBox90d(
+        image_keys=["image"],
+        box_keys=["boxes"],
+        box_ref_image_keys="image",
+        prob=0.1,
+        max_k=3,
+        spatial_axes=(0, 1),
+    ),
+    ClipBoxToImaged(
+        box_keys=["boxes"],
+        label_keys=["labels"],
+        box_ref_image_keys="image",
+        remove_empty=True,
+    ),
+])
+```
+
+---
+
+## Detection loss
+
+`BoxGIoULoss` computes the Generalised Intersection over Union loss for bounding-box regression. It is more informative than smooth-L1 loss because it also penalises non-overlapping boxes.
+
+```python
+from monai.losses import BoxGIoULoss
+
+giou_loss = BoxGIoULoss(reduction="mean")
+loss = giou_loss(predicted_boxes, target_boxes)
+```
+
+The detector's built-in training step uses a focal classification loss and a smooth-L1 box regression loss by default. `BoxGIoULoss` can be substituted when you need tighter bounding boxes.
+
+---
+
+## FROC metric
+
+The Free Response Operating Characteristic (FROC) score measures sensitivity at fixed false-positive-per-scan rates. It is the standard evaluation metric for lung nodule and lesion detection challenges.
+
+```python
+from monai.apps.pathology.metrics import LesionFROC
+
+froc = LesionFROC(
+    data=[
+        {
+            "prob_map": "path/to/prob_map.npy",
+            "tumor_mask": "path/to/ground_truth.tiff",
+            "level": 6,
+            "pixel_spacing": 0.243,
+        }
+    ],
+    grow_distance=75,            # µm — equivalent to ~5 tumour cells
+    itc_diameter=200,            # µm — max size to be classified as ITC
+    eval_thresholds=(0.25, 0.5, 1, 2, 4, 8),  # CAMELYON16 standard FP rates
+)
+score = froc.evaluate()
+```
+
+For 3-D CT detection, use `COCOMetric` which supports multiple IoU thresholds:
+
+```python
+results = coco_metric(val_outputs, val_targets)
+# results["AP_IoU_0.10_0.50_0.05_MaxDet_100"] — primary metric
+```
+
+---
+
+## Code example: detection model setup
+
+<Steps>
+  <Step title="Define anchor generator">
+    ```python
+    from monai.apps.detection.utils.anchor_utils import AnchorGeneratorWithAnchorShape
+
+    anchor_generator = AnchorGeneratorWithAnchorShape(
+        feature_map_scales=(1, 2),
+        base_anchor_shapes=((8, 8, 8),),
+    )
+    ```
+  </Step>
+
+  <Step title="Build detector">
+    ```python
+    from monai.apps.detection.networks.retinanet_detector import retinanet_resnet50_fpn_detector
+
+    detector = retinanet_resnet50_fpn_detector(
+        num_classes=1,
+        anchor_generator=anchor_generator,
+        returned_layers=[1, 2, 3],
+        spatial_dims=3,
+        n_input_channels=1,
+        conv1_t_size=7,
+        conv1_t_stride=(2, 2, 2),
+    )
+    detector = detector.to(device)
+    ```
+  </Step>
+
+  <Step title="Optimiser (network parameters only)">
+    ```python
+    import torch
+
+    optimizer = torch.optim.SGD(
+        detector.network.parameters(),
+        lr=1e-3,
+        momentum=0.9,
+        weight_decay=3e-5,
+        nesterov=True,
+    )
+    ```
+  </Step>
+
+  <Step title="Training step">
+    ```python
+    detector.train()
+    for batch in train_loader:
+        images  = [img.to(device) for img in batch["image"]]
+        targets = [
+            {"boxes": b.to(device), "labels": l.to(device)}
+            for b, l in zip(batch["boxes"], batch["labels"])
+        ]
+
+        optimizer.zero_grad()
+        loss_dict = detector(images, targets)
+        loss = sum(loss_dict.values())
+        loss.backward()
+        optimizer.step()
+    ```
+  </Step>
+
+  <Step title="Inference">
+    ```python
+    detector.eval()
+    with torch.no_grad():
+        predictions = detector([image.to(device)])
+
+    for pred in predictions:
+        print("boxes:",  pred["boxes"].shape)
+        print("labels:", pred["labels"])
+        print("scores:", pred["labels_scores"])
+    ```
+  </Step>
+
+  <Step title="Save and load the model">
+    ```python
+    # Save
+    torch.save(detector.network.state_dict(), "detector.pt")
+
+    # Load
+    detector.network.load_state_dict(
+        torch.load("detector.pt", weights_only=True)
+    )
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+The detector wraps a `network` module. Only `detector.network` contains learnable parameters — always pass `detector.network.parameters()` to the optimiser and save `detector.network.state_dict()`, not `detector.state_dict()`.
+</Warning>

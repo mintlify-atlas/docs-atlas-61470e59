@@ -1,0 +1,478 @@
+---
+title: Pathology
+description: Computational pathology with MONAI — WSI readers, patch pipelines, HoVerNet nuclei segmentation, MIL, and lesion FROC evaluation.
+---
+
+MONAI's pathology module provides tooling for the unique challenges of computational pathology: reading gigapixel whole slide images (WSIs) without loading them into memory, extracting and classifying tissue patches, detecting and segmenting nuclei, and computing FROC scores for lesion detection.
+
+<CardGroup cols={2}>
+  <Card title="WSI Readers" icon="microscope">
+    CuCIM and OpenSlide backends with level, mpp, and power-based resolution selection
+  </Card>
+  <Card title="Patch pipelines" icon="grid">
+    PatchWSIDataset, SlidingPatchWSIDataset, GridPatchd for gigapixel image processing
+  </Card>
+  <Card title="HoVerNet" icon="circle-nodes">
+    Simultaneous nuclei segmentation and classification from H&E histology
+  </Card>
+  <Card title="FROC Metric" icon="chart-line">
+    Free Response Operating Characteristic scoring for lesion detection
+  </Card>
+</CardGroup>
+
+---
+
+## WSI readers
+
+MONAI provides a unified `WSIReader` abstraction with pluggable backends. All readers support resolution selection by pyramid level, microns-per-pixel (mpp), or objective power.
+
+```python
+from monai.data import WSIReader
+
+# CuCIM backend (GPU-accelerated, recommended)
+reader = WSIReader(backend="cuCIM", level=0)
+
+# OpenSlide backend (CPU, broad format support)
+reader = WSIReader(backend="OpenSlide", level=0)
+```
+
+### CuCIMWSIReader
+
+```python
+from monai.data.wsi_reader import CuCIMWSIReader
+
+reader = CuCIMWSIReader(
+    level=0,            # pyramid level (0 = highest resolution)
+    mpp=0.25,           # resolution in microns per pixel
+    # only one of level / mpp / power should be set
+)
+
+wsi = reader.read("slide.svs")
+patch, meta = reader.get_data(
+    wsi,
+    location=(1000, 2000),   # (col, row) top-left corner in level-0 coords
+    size=(512, 512),          # patch size in pixels at the requested level
+    level=0,
+)
+```
+
+### OpenSlideWSIReader
+
+```python
+from monai.data.wsi_reader import OpenSlideWSIReader
+
+reader = OpenSlideWSIReader(
+    level=2,       # lower resolution pyramid level for overview
+    power=20,      # objective power (e.g. 20x)
+)
+```
+
+<Note>
+Only **one** of `level`, `mpp`, or `power` should be specified. Parameters provided to `get_data()` override those set in the constructor.
+</Note>
+
+### Supported parameters
+
+| Parameter | Description |
+|---|---|
+| `level` | Integer pyramid level; `0` is the full resolution |
+| `mpp` | Microns per pixel — use for resolution-independent access |
+| `power` | Objective power (e.g. `40` for 40× magnification) |
+| `location` | `(col, row)` top-left pixel position in level-0 coordinates |
+| `size` | `(width, height)` of the extracted patch |
+| `channel_dim` | Dimension to place the colour channel (`-1` for HWC, `0` for CHW) |
+
+---
+
+## Patch-based processing pipeline
+
+WSI images are gigapixels in size — they cannot be loaded into memory as a whole. Instead, patches are extracted on the fly. MONAI provides two dataset classes for this pattern.
+
+### PatchWSIDataset
+
+Extracts a fixed patch around each pre-specified location.
+
+```python
+from monai.data import PatchWSIDataset
+
+data = [
+    {"image": "slide1.svs", "location": [1000, 2000], "label": 1},
+    {"image": "slide1.svs", "location": [3000, 4000], "label": 0},
+]
+
+dataset = PatchWSIDataset(
+    data=data,
+    patch_size=256,          # square patch in pixels
+    patch_level=0,           # pyramid level to extract from
+    transform=patch_transforms,
+    reader="cuCIM",
+)
+```
+
+### SlidingPatchWSIDataset
+
+Exhaustively tiles the foreground of a WSI using a sliding window.
+
+```python
+from monai.data import SlidingPatchWSIDataset
+
+dataset = SlidingPatchWSIDataset(
+    data=[{"image": "slide.svs"}],
+    patch_size=256,
+    patch_level=0,
+    overlap=0,           # overlap between adjacent patches
+    offset=(0, 0),       # starting offset for the grid
+    reader="cuCIM",
+)
+```
+
+### GridPatchd transform
+
+For inline patch extraction within a transform pipeline:
+
+```python
+from monai.transforms import Compose, LoadImaged, GridPatchd, RandGridPatchd
+
+# Non-random grid — use for inference / dense prediction
+grid_patch = GridPatchd(
+    keys=["image"],
+    patch_size=(256, 256),
+    overlap=0.0,
+)
+
+# Random grid — use for training with data augmentation
+rand_grid_patch = RandGridPatchd(
+    keys=["image"],
+    patch_size=(256, 256),
+    min_offset=0,
+    max_offset=None,   # random offset up to patch_size
+)
+```
+
+---
+
+## HoVerNet
+
+HoVerNet (Hover-Net) performs **simultaneous** nuclei instance segmentation and nuclear-type classification from H&E-stained histology images. It has three output branches:
+
+- **NP** (Nucleus Prediction): binary foreground/background segmentation
+- **HV** (Horizontal-Vertical distances): distance maps to each nucleus centroid, used for instance separation
+- **NC** (Nuclear Classification): per-nucleus cell-type probabilities
+
+```python
+from monai.networks.nets import HoVerNet
+
+model = HoVerNet(
+    mode="fast",            # "fast" (default) or "original"
+    in_channels=3,          # RGB histology image
+    np_out_channels=2,      # binary nucleus prediction
+    out_classes=5,          # number of nuclear type classes (0 = no classification)
+    act=("relu", {"inplace": True}),
+    norm="batch",
+    decoder_padding=False,
+    dropout_prob=0.0,
+    pretrained_url=None,    # optional URL for pre-trained encoder weights
+    freeze_encoder=False,
+)
+```
+
+<Accordion title="Constructor parameters">
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mode` | `str` | `"fast"` | `"fast"` pads convolutions to preserve spatial size; `"original"` crops to valid region |
+| `in_channels` | `int` | `3` | Number of input channels (typically 3 for RGB) |
+| `np_out_channels` | `int` | `2` | Output channels for the nucleus prediction branch |
+| `out_classes` | `int` | `0` | Number of nuclear type classes; `0` disables the NC branch |
+| `decoder_padding` | `bool` | `False` | Pad convolutions in decoder (required for `mode="fast"` with consistent output size) |
+| `dropout_prob` | `float` | `0.0` | Dropout rate in dense blocks |
+| `pretrained_url` | `str \| None` | `None` | URL to pre-trained preact-ResNet50 or standard ResNet-50 weights |
+| `adapt_standard_resnet` | `bool` | `False` | Set `True` when loading torchvision standard ResNet-50 weights |
+| `freeze_encoder` | `bool` | `False` | Freeze the encoder during fine-tuning |
+
+</Accordion>
+
+**Forward pass:**
+
+```python
+outputs = model(image)   # image: (B, 3, H, W)
+
+np_pred = outputs[HoVerNet.Branch.NP]   # nucleus probability map
+hv_pred = outputs[HoVerNet.Branch.HV]   # horizontal-vertical distance map
+nc_pred = outputs[HoVerNet.Branch.NC]   # nuclear type predictions (if out_classes > 0)
+```
+
+**HoVerNetLoss:**
+
+```python
+from monai.apps.pathology.losses import HoVerNetLoss
+
+loss_fn = HoVerNetLoss(
+    lambda_hv_mse=2.0,       # weight for HV MSE loss
+    lambda_hv_mse_grad=1.0,  # weight for HV gradient MSE loss
+    lambda_np_ce=1.0,        # weight for NP cross-entropy
+    lambda_np_dice=1.0,      # weight for NP Dice loss
+    lambda_nc_ce=1.0,        # weight for NC cross-entropy
+    lambda_nc_dice=1.0,      # weight for NC Dice loss
+)
+
+loss = loss_fn(outputs, targets)
+```
+
+---
+
+## MIL model (Multiple Instance Learning)
+
+For slide-level classification, MONAI provides MIL components where a bag of patch features is aggregated into a slide-level prediction. See `monai.networks.nets.milmodel` and the dedicated MIL tutorial for the full workflow.
+
+```python
+from monai.networks.nets import MILModel
+
+model = MILModel(
+    num_classes=2,
+    mil_mode="att",       # "att" (attention MIL) or "mean"/"max" pooling
+    pretrained=True,
+    backbone="resnet18",
+)
+```
+
+The MIL tutorial demonstrates self-attention transformer blocks for explicit patch-dependency modelling.
+
+---
+
+## NuClick interactive segmentation
+
+NuClick accelerates nuclei annotation by requiring only a single click inside a nucleus. The model then generates the segmentation mask.
+
+```python
+# NuClick is available through the monai.apps.nuclick module
+from monai.apps.nuclick.transforms import AddClickSignalsd
+
+# Add Gaussian guidance signal at annotator click locations
+add_signal = AddClickSignalsd(
+    image="image",
+    foreground="foreground",   # click coordinates dict
+    key="image",
+)
+```
+
+---
+
+## Pathology transforms
+
+### Stain normalisation
+
+H&E stain intensity varies between slides and laboratories. MONAI provides stain-normalisation transforms to reduce this variability.
+
+```python
+from monai.apps.pathology.transforms.stain.array import (
+    ExtractHEStains,
+    NormalizeHEStains,
+)
+
+# Dictionary-style equivalents
+from monai.apps.pathology.transforms.stain.dictionary import (
+    ExtractHEStainsd,
+    NormalizeHEStainsd,
+)
+
+norm = NormalizeHEStains(
+    target_he=None,   # provide a reference stain matrix, or use the default
+)
+normalised_patch = norm(patch)
+```
+
+### Post-processing
+
+```python
+from monai.apps.pathology.transforms.post.array import (
+    GenerateInstanceBorder,
+    GenerateInstanceCentroid,
+    GenerateInstanceContour,
+    GenerateInstanceType,
+    GenerateWatershedMarkers,
+    GenerateWatershedMask,
+    HoVerNetInstanceMapPostProcessing,
+    HoVerNetNuclearTypePostProcessing,
+)
+```
+
+### GridPatchd / RandGridPatchd (patch extraction)
+
+```python
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    GridPatchd,
+    RandGridPatchd,
+)
+
+train_transforms = Compose([
+    LoadImaged(keys=["image"]),
+    EnsureChannelFirstd(keys=["image"]),
+    RandGridPatchd(
+        keys=["image"],
+        patch_size=(256, 256),
+        min_offset=0,
+        max_offset=None,
+    ),
+])
+```
+
+---
+
+## LesionFROC metric
+
+The FROC score measures sensitivity at fixed false-positive rates per whole slide image. It is the standard metric for the CAMELYON lymph node metastasis detection challenges.
+
+```python
+from monai.apps.pathology.metrics import LesionFROC
+
+froc = LesionFROC(
+    data=[
+        {
+            "prob_map":   "results/slide1_prob.npy",   # predicted probability map
+            "tumor_mask": "annotations/slide1.tiff",   # binary ground-truth mask
+            "level":      6,                           # resolution level of the prob map
+            "pixel_spacing": 0.243,                    # µm/pixel at level 0
+        },
+        # ... more slides
+    ],
+    grow_distance=75,           # tumour growth radius in µm (~5 cells)
+    itc_diameter=200,           # ITC max diameter in µm
+    eval_thresholds=(0.25, 0.5, 1, 2, 4, 8),  # CAMELYON16 FP rates
+    nms_sigma=0.0,
+    nms_prob_threshold=0.5,
+    nms_box_size=48,
+    image_reader_name="cuCIM",
+)
+
+froc_score = froc.evaluate()
+print(f"FROC score: {froc_score:.4f}")
+```
+
+---
+
+## Code example: extracting and classifying WSI patches
+
+<Steps>
+  <Step title="Set up the patch dataset">
+    ```python
+    from monai.data import PatchWSIDataset
+    from monai.transforms import (
+        Compose,
+        ToTensord,
+        NormalizeIntensityd,
+    )
+    from monai.apps.pathology.transforms.stain.dictionary import NormalizeHEStainsd
+
+    patch_transforms = Compose([
+        NormalizeHEStainsd(keys=["image"]),   # stain normalisation
+        NormalizeIntensityd(keys=["image"]),
+        ToTensord(keys=["image"]),
+    ])
+
+    data = [
+        {"image": "slides/slide001.svs", "location": [x, y], "label": label}
+        for x, y, label in patch_locations
+    ]
+
+    dataset = PatchWSIDataset(
+        data=data,
+        patch_size=256,
+        patch_level=0,
+        transform=patch_transforms,
+        reader="cuCIM",
+    )
+
+    loader = DataLoader(dataset, batch_size=32, num_workers=8)
+    ```
+  </Step>
+
+  <Step title="Train a patch classifier">
+    ```python
+    import torch
+    import torch.nn as nn
+    from torchvision.models import resnet18
+
+    # Simple patch-level classifier
+    backbone = resnet18(pretrained=True)
+    backbone.fc = nn.Linear(512, num_classes)
+    backbone = backbone.to(device)
+
+    optimizer = torch.optim.Adam(backbone.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    backbone.train()
+    for batch in loader:
+        images = batch["image"].to(device)    # (B, 3, 256, 256)
+        labels = batch["label"].to(device)
+
+        optimizer.zero_grad()
+        logits = backbone(images)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+    ```
+  </Step>
+
+  <Step title="Dense prediction on a new slide">
+    ```python
+    from monai.data import SlidingPatchWSIDataset
+    from torch.utils.data import DataLoader
+    import numpy as np
+
+    slide_dataset = SlidingPatchWSIDataset(
+        data=[{"image": "slides/test_slide.svs"}],
+        patch_size=256,
+        patch_level=0,
+        overlap=0,
+        transform=patch_transforms,
+        reader="cuCIM",
+    )
+
+    slide_loader = DataLoader(slide_dataset, batch_size=64, num_workers=4)
+
+    backbone.eval()
+    predictions = []
+    locations   = []
+
+    with torch.no_grad():
+        for batch in slide_loader:
+            images = batch["image"].to(device)
+            logits = backbone(images)
+            probs  = torch.softmax(logits, dim=1)[:, 1]   # tumour probability
+            predictions.append(probs.cpu().numpy())
+            locations.append(batch["image"].meta["location"])
+
+    prob_map = np.concatenate(predictions)
+    ```
+  </Step>
+
+  <Step title="Evaluate with FROC">
+    ```python
+    import numpy as np
+    from monai.apps.pathology.metrics import LesionFROC
+
+    np.save("results/test_slide_prob.npy", prob_map)
+
+    froc = LesionFROC(
+        data=[{
+            "prob_map":    "results/test_slide_prob.npy",
+            "tumor_mask":  "annotations/test_slide.tiff",
+            "level":       6,
+            "pixel_spacing": 0.243,
+        }],
+        eval_thresholds=(0.25, 0.5, 1, 2, 4, 8),
+    )
+
+    score = froc.evaluate()
+    print(f"FROC: {score:.4f}")
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+CuCIM requires a CUDA-capable GPU and the `cucim` package installed via `pip install cucim`. On CPU-only machines, use `backend="OpenSlide"` with the `openslide-python` package instead.
+</Warning>

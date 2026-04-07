@@ -1,0 +1,426 @@
+---
+title: 'MONAI Bundle'
+description: 'Package models with metadata, configs, and weights for reproducible training and inference.'
+---
+
+A MONAI Bundle is a self-contained model package that combines network weights, structured configuration files, and metadata into a single distributable directory. Bundles let you reproduce training runs, share models, and integrate them into downstream applications—all from the same artifact.
+
+<CardGroup cols={2}>
+  <Card title="Config-driven workflows" icon="file-code">
+    Define training and inference pipelines entirely in JSON or YAML. No code changes needed to swap components.
+  </Card>
+  <Card title="Model Zoo ready" icon="box">
+    Download and run community-contributed bundles directly from the MONAI Model Zoo with a single CLI command.
+  </Card>
+  <Card title="CLI and Python APIs" icon="terminal">
+    Run, verify, and export bundles from the command line or Python. Override any parameter at runtime.
+  </Card>
+  <Card title="Experiment tracking" icon="chart-line">
+    Built-in MLflow and TensorBoard integration via the `tracking` parameter—no extra wiring required.
+  </Card>
+</CardGroup>
+
+## Bundle directory structure
+
+A bundle is a directory with a conventional layout:
+
+```text
+MyBundle/
+├── configs/
+│   ├── metadata.json       # model description, version, schema URL
+│   ├── train.json          # training workflow config
+│   ├── inference.json      # inference workflow config
+│   └── logging.conf        # Python logging configuration
+├── models/
+│   ├── model.pt            # PyTorch state dict (required)
+│   ├── model.ts            # TorchScript export (optional)
+│   └── model.onnx          # ONNX export (optional)
+└── docs/
+    ├── README.md
+    └── license.txt
+```
+
+<Note>
+`configs/metadata.json` must contain a `schema` field pointing to the JSON Schema URL used for validation. The `models/model.pt` checkpoint is the only strictly required artifact.
+</Note>
+
+## Bundle config syntax
+
+Bundle configs are JSON or YAML files that describe Python objects and workflows declaratively. A small set of special characters gives the syntax its power.
+
+### Instantiating Python objects with `_target_`
+
+Use `_target_` to specify a fully-qualified Python class or function. All other keys become constructor arguments.
+
+```json
+{
+  "network": {
+    "_target_": "monai.networks.nets.BasicUNet",
+    "spatial_dims": 3,
+    "in_channels": 1,
+    "out_channels": 2,
+    "features": [16, 16, 32, 32, 64, 64]
+  }
+}
+```
+
+The equivalent YAML:
+
+```yaml
+network:
+  _target_: monai.networks.nets.BasicUNet
+  spatial_dims: 3
+  in_channels: 1
+  out_channels: 2
+  features: [16, 16, 32, 32, 64, 64]
+```
+
+<AccordionGroup>
+  <Accordion title="Optional _target_ keys">
+    | Key | Purpose |
+    |-----|---------|
+    | `_disabled_` | Set to `"true"` to skip instantiation of this component. |
+    | `_desc_` | Free-text description, ignored at runtime. |
+    | `_requires_` | Reference to another config item that must be evaluated first. |
+    | `_mode_` | `"default"` (instantiate), `"callable"` (return partial), or `"debug"` (pdb). |
+  </Accordion>
+</AccordionGroup>
+
+### `@` — reference another config item
+
+`@id` inserts the resolved value of another item. Use `::` (or `#`) to navigate nested keys.
+
+```json
+{
+  "spatial_dims": 3,
+  "network": {
+    "_target_": "monai.networks.nets.BasicUNet",
+    "spatial_dims": "@spatial_dims",
+    "in_channels": 1,
+    "out_channels": 2
+  }
+}
+```
+
+Relative references are also supported: `@#sibling` refers to a key at the same level, and `@##parent_sibling` goes one level up.
+
+### `$` — evaluate a Python expression
+
+Prefix a string with `$` to evaluate it as a Python expression at parse time. You can use `@` references inside expressions.
+
+```json
+{
+  "num_classes": 4,
+  "out_channels": "$@num_classes + 1",
+  "device": "$torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')"
+}
+```
+
+Import statements are also supported and make the imported name available as a global:
+
+```json
+{
+  "imports": ["$import torch", "$from monai.networks import trt_compile"]
+}
+```
+
+### `%` — macro substitution
+
+`%` replaces a config value with content from another file or from within the same config, before any instantiation happens.
+
+```json
+{
+  "in_channels": "%./base_config.json#network#in_channels"
+}
+```
+
+### Merging multiple config files
+
+When loading multiple files, keys are overridden in order. Prefix a key with `+` to merge (extend lists, update dicts) instead of replace:
+
+```json
+{
+  "+preprocessing#transforms": ["$@extra_transform"]
+}
+```
+
+## ConfigParser
+
+`ConfigParser` is the programmatic API for loading, inspecting, and instantiating bundle configs.
+
+```python
+from monai.bundle import ConfigParser
+
+# Load a config file
+parser = ConfigParser()
+parser.read_config("configs/train.json")
+parser.read_meta("configs/metadata.json")
+
+# Read or modify values before instantiation
+print(parser["network"]["in_channels"])  # 1
+parser["network"]["in_channels"] = 4
+
+# Instantiate a specific component
+network = parser.get_parsed_content("network", instantiate=True)
+
+# Override nested keys programmatically
+parser.update({"train#max_epochs": 100, "train#learning_rate": 1e-4})
+```
+
+ID navigation uses `::` or `#` as separators. Integer keys index into lists.
+
+```python
+# Access the third transform in the preprocessing pipeline
+xform = parser.get_parsed_content("preprocessing#transforms#2", instantiate=True)
+```
+
+## BundleWorkflow
+
+`BundleWorkflow` is the base class for config-driven training and inference. `ConfigWorkflow` is the concrete implementation you'll use most often.
+
+```python
+from monai.bundle import ConfigWorkflow
+
+# Create a training workflow from config files
+workflow = ConfigWorkflow(
+    config_file="configs/train.json",
+    meta_file="configs/metadata.json",
+    workflow_type="train",
+    # override any config value at construction time
+    **{"train#max_epochs": 50}
+)
+
+workflow.initialize()
+workflow.run()
+workflow.finalize()
+```
+
+Set `workflow_type="infer"` (or `"inference"`, `"eval"`) to load an inference workflow instead. The `check_properties()` method reports any required config keys that are missing.
+
+## CLI commands
+
+Install the optional `fire` dependency to use the CLI: `pip install monai[fire]`.
+
+<Tabs>
+  <Tab title="run">
+    Execute a bundle workflow from config files.
+
+    ```bash
+    # Basic run
+    python -m monai.bundle run \
+      --config_file configs/train.json \
+      --meta_file configs/metadata.json
+
+    # Override config values at runtime
+    python -m monai.bundle run \
+      --config_file configs/train.json \
+      --"train#max_epochs" 100 \
+      --"network#in_channels" 4
+
+    # Override with values from another config file
+    python -m monai.bundle run \
+      --config_file configs/train.json \
+      --network "%/path/to/other.json#network"
+
+    # Store default args in a file to simplify the command
+    python -m monai.bundle run \
+      --args_file args.json \
+      --config_file configs/train.json
+    ```
+  </Tab>
+  <Tab title="download">
+    Download a bundle from the Model Zoo or other sources.
+
+    ```bash
+    # Download the latest version from MONAI hosting (default)
+    python -m monai.bundle download --name spleen_ct_segmentation --bundle_dir ./
+
+    # Specify a version
+    python -m monai.bundle download \
+      --name spleen_ct_segmentation \
+      --version "0.3.7" \
+      --bundle_dir ./models
+
+    # Download from NGC
+    python -m monai.bundle download \
+      --name spleen_ct_segmentation \
+      --source ngc \
+      --bundle_dir ./
+
+    # Download from Hugging Face Hub
+    python -m monai.bundle download \
+      --name my_bundle \
+      --source huggingface_hub \
+      --repo "MyOrg/my-bundle-repo"
+    ```
+  </Tab>
+  <Tab title="verify">
+    Validate a bundle's metadata against its declared JSON Schema.
+
+    ```bash
+    python -m monai.bundle verify_metadata \
+      --meta_file configs/metadata.json \
+      --filepath /tmp/schema.json
+    ```
+  </Tab>
+  <Tab title="export">
+    Export a trained model to TorchScript or ONNX.
+
+    ```bash
+    # TorchScript export
+    python -m monai.bundle ckpt_export \
+      --config_file configs/inference.json \
+      --filepath models/model.ts
+
+    # ONNX export
+    python -m monai.bundle onnx_export \
+      --config_file configs/inference.json \
+      --filepath models/model.onnx
+    ```
+  </Tab>
+</Tabs>
+
+## Model Zoo
+
+The MONAI Model Zoo hosts community-contributed bundles for common medical imaging tasks. You can download and run them without writing any training code.
+
+```python
+from monai.bundle import download, load
+
+# Download a bundle
+download(
+    name="spleen_ct_segmentation",
+    bundle_dir="./models",
+)
+
+# Load model weights into a network instance
+model = load(
+    name="spleen_ct_segmentation",
+    bundle_dir="./models",
+    workflow_type="infer",
+)
+model.eval()
+```
+
+To list available bundles:
+
+```python
+from monai.bundle import get_all_bundles_list
+
+bundles = get_all_bundles_list()
+for name, version in bundles:
+    print(f"{name}  v{version}")
+```
+
+## Creating your own bundle
+
+<Steps>
+  <Step title="Initialize the directory structure">
+    Use `init_bundle` to scaffold the standard layout:
+
+    ```bash
+    python -m monai.bundle init_bundle --bundle_dir ./MyBundle
+    ```
+
+    This creates the `configs/`, `models/`, and `docs/` directories with template files.
+  </Step>
+  <Step title="Write the metadata">
+    Edit `configs/metadata.json` to describe your model:
+
+    ```json
+    {
+      "schema": "https://github.com/Project-MONAI/MONAI-extra-test-data/releases/download/0.8.1/meta_schema_20220324.json",
+      "version": "0.1.0",
+      "monai_version": "1.3.0",
+      "pytorch_version": "2.0.0",
+      "name": "MyBundle",
+      "task": "Segmentation",
+      "description": "A 3D spleen segmentation model.",
+      "authors": "Your Name",
+      "copyright": "Copyright (c) Your Org"
+    }
+    ```
+  </Step>
+  <Step title="Define the training config">
+    Create `configs/train.json` with your network, optimizer, and data pipeline:
+
+    ```json
+    {
+      "bundle_root": ".",
+      "device": "$torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')",
+      "max_epochs": 100,
+      "network_def": {
+        "_target_": "monai.networks.nets.UNet",
+        "spatial_dims": 3,
+        "in_channels": 1,
+        "out_channels": 2,
+        "channels": [16, 32, 64, 128],
+        "strides": [2, 2, 2]
+      },
+      "network": "$@network_def.to(@device)",
+      "loss_function": {
+        "_target_": "monai.losses.DiceLoss",
+        "softmax": true
+      },
+      "optimizer": {
+        "_target_": "torch.optim.Adam",
+        "params": "$@network.parameters()",
+        "lr": 1e-4
+      },
+      "run": ["$@trainer.run()"],
+      "trainer": {
+        "_target_": "monai.engines.SupervisedTrainer",
+        "device": "@device",
+        "max_epochs": "@max_epochs",
+        "train_data_loader": "@train_dataloader",
+        "network": "@network",
+        "optimizer": "@optimizer",
+        "loss_function": "@loss_function"
+      }
+    }
+    ```
+  </Step>
+  <Step title="Train from the CLI">
+    ```bash
+    python -m monai.bundle run \
+      --config_file configs/train.json \
+      --meta_file configs/metadata.json
+    ```
+
+    Override parameters at runtime without editing the config:
+
+    ```bash
+    python -m monai.bundle run \
+      --config_file configs/train.json \
+      --max_epochs 200 \
+      --"optimizer#lr" 5e-5
+    ```
+  </Step>
+  <Step title="Verify the metadata">
+    ```bash
+    python -m monai.bundle verify_metadata \
+      --meta_file configs/metadata.json \
+      --filepath /tmp/schema.json
+    ```
+  </Step>
+</Steps>
+
+## Enabling experiment tracking
+
+Pass `tracking="mlflow"` to `ConfigWorkflow` or the `run` CLI command to automatically log parameters and metrics to MLflow:
+
+```python
+workflow = ConfigWorkflow(
+    config_file="configs/train.json",
+    tracking="mlflow",
+    # optionally override tracking settings
+    **{"output_dir": "./mlruns", "experiment_name": "spleen_seg"}
+)
+```
+
+```bash
+python -m monai.bundle run \
+  --config_file configs/train.json \
+  --tracking mlflow \
+  --output_dir ./mlruns
+```

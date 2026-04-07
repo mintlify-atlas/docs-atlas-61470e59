@@ -1,0 +1,429 @@
+---
+title: 'monai.data'
+description: 'Dataset classes, data loaders, image readers, and data utilities for building medical imaging pipelines.'
+---
+
+The `monai.data` module provides everything needed to build a performant data pipeline: PyTorch-compatible dataset classes with optional caching, specialized image readers for NIfTI/DICOM/WSI formats, and utilities for collating and partitioning data.
+
+## Core data structures
+
+### MetaTensor
+
+A `torch.Tensor` subclass that carries spatial metadata (affine matrix, voxel spacing, original filename, etc.) alongside image data. Used throughout MONAI as the standard image representation.
+
+```python
+from monai.data import MetaTensor
+import torch
+
+t = MetaTensor(torch.zeros(1, 64, 64, 64))
+t.meta["filename_or_obj"] = "scan.nii.gz"
+print(t.affine)   # 4×4 affine matrix
+print(t.shape)    # torch.Size([1, 64, 64, 64])
+```
+
+Metadata is preserved through transforms, slicing, and device transfers.
+
+---
+
+### MetaObj
+
+Base class for objects that carry a metadata dictionary. Both `MetaTensor` and other MONAI data types inherit from `MetaObj`.
+
+---
+
+## Datasets
+
+### Dataset
+
+The base PyTorch dataset. Applies a transform pipeline lazily at access time — no data is cached.
+
+```python
+from monai.data import Dataset
+from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd
+
+data_dicts = [
+    {"image": "img1.nii.gz", "label": "lbl1.nii.gz"},
+    {"image": "img2.nii.gz", "label": "lbl2.nii.gz"},
+]
+
+ds = Dataset(data=data_dicts, transform=Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+]))
+sample = ds[0]
+```
+
+<ParamField path="data" type="Sequence" required>
+  Input data items (e.g., list of file path dictionaries).
+</ParamField>
+
+<ParamField path="transform" type="Callable | Sequence[Callable] | None">
+  Transform or sequence of transforms applied to each item on access.
+</ParamField>
+
+---
+
+### CacheDataset
+
+Pre-computes and caches the deterministic portion of the transform pipeline in memory. Random transforms are applied at access time.
+
+```python
+from monai.data import CacheDataset
+
+ds = CacheDataset(
+    data=data_dicts,
+    transform=transforms,
+    cache_rate=1.0,
+    num_workers=4,
+    progress=True,
+)
+```
+
+<ParamField path="data" type="Sequence" required>
+  Input data items.
+</ParamField>
+
+<ParamField path="transform" type="Callable | Sequence[Callable]" required>
+  Full transform pipeline. Deterministic transforms before the first `Randomizable` are cached.
+</ParamField>
+
+<ParamField path="cache_rate" type="float" default="1.0">
+  Fraction of dataset to cache, between 0.0 and 1.0.
+</ParamField>
+
+<ParamField path="num_workers" type="int | None" default="1">
+  Number of worker processes for parallel cache computation.
+</ParamField>
+
+<ParamField path="progress" type="bool" default="True">
+  Show a `tqdm` progress bar during cache population.
+</ParamField>
+
+<ParamField path="copy_cache" type="bool" default="True">
+  If `True`, return a deep copy of cached data to prevent mutation.
+</ParamField>
+
+<ParamField path="as_contiguous" type="bool" default="True">
+  Convert cached tensors to contiguous memory layout.
+</ParamField>
+
+---
+
+### PersistentDataset
+
+Like `CacheDataset` but persists the cache to disk. Cache survives program restarts and is shared across experiments with identical deterministic transforms.
+
+```python
+from monai.data import PersistentDataset
+
+ds = PersistentDataset(
+    data=data_dicts,
+    transform=transforms,
+    cache_dir="/tmp/monai_cache",
+)
+```
+
+<ParamField path="data" type="Sequence" required>
+  Input data items (must be serializable for hashing).
+</ParamField>
+
+<ParamField path="transform" type="Callable | Sequence[Callable]" required>
+  Full transform pipeline.
+</ParamField>
+
+<ParamField path="cache_dir" type="Path | str | None" required>
+  Directory for persistent cache files. `None` disables caching.
+</ParamField>
+
+<ParamField path="hash_func" type="Callable" default="pickle_hashing">
+  Function to compute a cache key from a data item.
+</ParamField>
+
+<ParamField path="hash_transform" type="Callable | None">
+  Function to include transform identity in cache keys. Helps invalidate stale cache when transforms change.
+</ParamField>
+
+<Warning>
+Set `weights_only=False` only when you trust the cache source. MONAI defaults to `weights_only=True` for security, which prevents loading `MetaTensor` objects directly.
+</Warning>
+
+---
+
+### SmartCacheDataset
+
+Extends `CacheDataset` with a rotating cache window. During training, a fraction of cached items is replaced after each epoch, so the effective dataset is larger than available memory.
+
+```python
+from monai.data import SmartCacheDataset
+
+ds = SmartCacheDataset(
+    data=data_dicts,
+    transform=transforms,
+    replace_rate=0.1,
+    cache_num=200,
+)
+ds.start()   # begins background replacement thread
+# ... training loop ...
+ds.shutdown()
+```
+
+<ParamField path="replace_rate" type="float" required>
+  Fraction of cached items to replace after each epoch.
+</ParamField>
+
+<ParamField path="cache_num" type="int" default="sys.maxsize">
+  Maximum number of items to hold in the cache at once.
+</ParamField>
+
+---
+
+### ZipDataset
+
+Combines multiple datasets, yielding tuples of items drawn from each.
+
+```python
+from monai.data import ZipDataset
+
+combined = ZipDataset([image_ds, label_ds], transform=post_transform)
+```
+
+<ParamField path="datasets" type="Sequence[Dataset]" required>
+  Datasets to zip together.
+</ParamField>
+
+---
+
+### PatchDataset
+
+Wraps a dataset to yield patches extracted from each item.
+
+```python
+from monai.data import PatchDataset
+from monai.transforms import RandSpatialCrop
+
+patch_ds = PatchDataset(
+    dataset=base_ds,
+    patch_func=RandSpatialCrop(roi_size=(64, 64, 64), random_size=False),
+    samples_per_image=4,
+)
+```
+
+<ParamField path="dataset" type="Dataset" required>
+  Source dataset to extract patches from.
+</ParamField>
+
+<ParamField path="patch_func" type="Callable" required>
+  Callable that returns a list of patches from a single data item.
+</ParamField>
+
+<ParamField path="samples_per_image" type="int" default="1">
+  Number of patches to sample per image.
+</ParamField>
+
+---
+
+## Predefined datasets
+
+### DecathlonDataset
+
+Downloads and loads any task from the [Medical Segmentation Decathlon](http://medicaldecathlon.com/).
+
+```python
+from monai.data import DecathlonDataset
+
+ds = DecathlonDataset(
+    root_dir="/data/decathlon",
+    task="Task09_Spleen",
+    section="training",
+    download=True,
+    transform=train_transforms,
+)
+```
+
+<ParamField path="root_dir" type="str" required>
+  Root directory where the dataset is stored or will be downloaded.
+</ParamField>
+
+<ParamField path="task" type="str" required>
+  Decathlon task name, e.g., `"Task09_Spleen"`, `"Task01_BrainTumour"`.
+</ParamField>
+
+<ParamField path="section" type="str" required>
+  One of `"training"` or `"test"`.
+</ParamField>
+
+<ParamField path="download" type="bool" default="False">
+  If `True`, download the dataset from the Decathlon server.
+</ParamField>
+
+<ParamField path="transform" type="Callable | None">
+  Transform applied to each loaded item.
+</ParamField>
+
+---
+
+### MedNISTDataset
+
+Provides the MedNIST classification benchmark (6 modality classes, ~60k images).
+
+```python
+from monai.data import MedNISTDataset
+
+ds = MedNISTDataset(root_dir="/data/mednist", section="training", download=True)
+```
+
+---
+
+## Data loaders
+
+### DataLoader
+
+MONAI's `DataLoader` inherits from `torch.utils.data.DataLoader` with `list_data_collate` as the default collate function to handle variable-size MONAI data.
+
+```python
+from monai.data import DataLoader, CacheDataset
+
+loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
+
+for batch in loader:
+    images = batch["image"]   # shape: (B, C, H, W, D)
+    labels = batch["label"]
+```
+
+---
+
+### ThreadDataLoader
+
+Like `DataLoader` but uses threads instead of processes. Avoids inter-process copy overhead for `CacheDataset` where items are already in memory.
+
+```python
+from monai.data import ThreadDataLoader
+
+loader = ThreadDataLoader(ds, batch_size=4, num_workers=2, buffer_size=4)
+```
+
+<ParamField path="dataset" type="Dataset" required>
+  Source dataset.
+</ParamField>
+
+<ParamField path="buffer_size" type="int" default="1">
+  Number of batches prefetched into a background buffer.
+</ParamField>
+
+<ParamField path="repeats" type="int" default="1">
+  Number of times to iterate over the dataset per epoch. Useful with `SmartCacheDataset`.
+</ParamField>
+
+---
+
+## Utilities
+
+### partition_dataset
+
+Splits a dataset list into `num_partitions` parts for distributed or cross-validation use.
+
+```python
+from monai.data import partition_dataset
+
+folds = partition_dataset(data_dicts, num_partitions=5, shuffle=True, seed=0)
+train_data = folds[0] + folds[1] + folds[2] + folds[3]
+val_data = folds[4]
+```
+
+<ParamField path="data" type="Sequence" required>
+  Input data to partition.
+</ParamField>
+
+<ParamField path="num_partitions" type="int | None">
+  Number of partitions to create.
+</ParamField>
+
+<ParamField path="ratios" type="Sequence[float] | None">
+  Partition sizes as ratios (alternative to `num_partitions`).
+</ParamField>
+
+<ParamField path="shuffle" type="bool" default="False">
+  Shuffle before partitioning.
+</ParamField>
+
+---
+
+### list_data_collate
+
+Default collate function that handles lists of dictionaries with variable-length tensors. Used automatically by `DataLoader`.
+
+```python
+from monai.data import list_data_collate
+
+batch = list_data_collate([ds[0], ds[1], ds[2]])
+```
+
+---
+
+### pad_list_data_collate
+
+Collate function that pads tensors to a uniform shape within each batch.
+
+```python
+from monai.data import DataLoader, pad_list_data_collate
+
+loader = DataLoader(ds, batch_size=4, collate_fn=pad_list_data_collate)
+```
+
+---
+
+### decollate_batch
+
+Reverses the collation step, splitting a batched dictionary back into a list of per-sample dictionaries. Required for per-sample post-processing.
+
+```python
+from monai.data import decollate_batch
+
+outputs = model(batch["image"])   # shape: (B, C, H, W, D)
+output_list = decollate_batch({"pred": outputs, "label": batch["label"]})
+# output_list is a list of B dicts, each with "pred" and "label"
+```
+
+---
+
+## Image I/O
+
+### ITKReader
+
+Reads images using SimpleITK/ITK. Supports NIfTI, NRRD, MHA, DICOM series, and most medical formats.
+
+```python
+from monai.data import ITKReader
+
+reader = ITKReader()
+img_array, metadata = reader.get_data(reader.read("scan.nii.gz"))
+```
+
+---
+
+### NibabelReader
+
+Reads NIfTI (`.nii`, `.nii.gz`) and MGH files using nibabel. Preferred for NIfTI data.
+
+```python
+from monai.data import NibabelReader
+
+reader = NibabelReader()
+img_array, metadata = reader.get_data(reader.read("scan.nii.gz"))
+```
+
+---
+
+### PILReader
+
+Reads 2D images in PNG, JPEG, TIFF, and other formats supported by Pillow.
+
+```python
+from monai.data import PILReader
+
+reader = PILReader(converter=lambda img: img.convert("L"))
+```
+
+<Tip>
+Pass a `converter` callable to `PILReader` to apply any PIL image preprocessing (e.g., mode conversion) at read time.
+</Tip>

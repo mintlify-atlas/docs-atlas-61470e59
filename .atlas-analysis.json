@@ -1,0 +1,112 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "MONAI",
+  "projectDescription": "A PyTorch-based open-source framework for deep learning in healthcare imaging, providing domain-specific tools for medical image I/O, transforms, networks, losses, metrics, and end-to-end training workflows.",
+  "theme": "palm",
+  "primaryColor": "#1A6BAD",
+  "lightColor": "#E8F4FD",
+  "darkColor": "#0D3D6B",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/transforms",
+              "concepts/datasets-and-dataloading",
+              "concepts/metatensor",
+              "concepts/networks-and-losses"
+            ]
+          },
+          {
+            "group": "Training & Inference",
+            "pages": [
+              "guides/workflows",
+              "guides/inferers",
+              "guides/metrics-and-evaluation",
+              "guides/acceleration"
+            ]
+          },
+          {
+            "group": "Advanced Features",
+            "pages": [
+              "guides/bundle",
+              "guides/auto3dseg",
+              "guides/federated-learning",
+              "guides/visualization"
+            ]
+          },
+          {
+            "group": "Applications",
+            "pages": [
+              "apps/segmentation",
+              "apps/detection",
+              "apps/generation",
+              "apps/pathology"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Modules",
+            "pages": [
+              "api/transforms",
+              "api/data",
+              "api/networks",
+              "api/losses",
+              "api/metrics",
+              "api/engines",
+              "api/inferers",
+              "api/bundle",
+              "api/optimizers",
+              "api/utils"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Domain-specific medical image transforms (spatial, intensity, I/O) with array and dictionary APIs",
+    "MetaTensor — PyTorch tensor extended with medical image metadata",
+    "50+ neural network architectures including UNet, SwinUNETR, SegResNet, ViT, DiffusionModelUNet",
+    "Medical loss functions: DiceLoss, GeneralizedDiceLoss, HausdorffDTLoss, FocalLoss, TverskyLoss",
+    "Evaluation metrics: MeanDice, HausdorffDistance, SurfaceDistance, ROCAUC, ConfusionMatrix",
+    "CacheDataset, PersistentDataset, SmartCacheDataset for accelerated training pipelines",
+    "Sliding window inference with configurable overlap and blending modes",
+    "MONAI Bundle: packaged model format with structured JSON configs for training and inference",
+    "Auto3DSeg: automated 3D medical image segmentation pipeline",
+    "Federated learning support via MonaiAlgo and ClientAlgo abstractions",
+    "Multi-GPU distributed training compatible with PyTorch DDP, Horovod, and SLURM",
+    "C++/CUDA extensions for Resampler, CRF, and fast bilateral filtering"
+  ],
+  "publicApiSurface": [
+    "monai.transforms — Compose, RandAffine, NormalizeIntensity, LoadImage, CropForeground, and 200+ transforms",
+    "monai.data.MetaTensor — core data structure combining Tensor with metadata",
+    "monai.data.Dataset, CacheDataset, PersistentDataset, SmartCacheDataset, DecathlonDataset",
+    "monai.networks.nets — UNet, SwinUNETR, SegResNet, UNETR, DynUNet, ViT, ResNet, DiffusionModelUNet, VISTA3D",
+    "monai.losses — DiceLoss, DiceCELoss, GeneralizedDiceLoss, FocalLoss, TverskyLoss, HausdorffDTLoss",
+    "monai.metrics — MeanDice, HausdorffDistanceMetric, SurfaceDistanceMetric, ROCAUCMetric, ConfusionMatrixMetric",
+    "monai.engines.SupervisedTrainer, SupervisedEvaluator, EnsembleEvaluator",
+    "monai.inferers.SlidingWindowInferer, SimpleInferer, DiffusionInferer",
+    "monai.bundle.ConfigParser, BundleWorkflow — structured config-based workflow definition",
+    "monai.auto3dseg.AutoRunner — end-to-end automated 3D segmentation pipeline",
+    "monai.fl.client.MonaiAlgo, ClientAlgo — federated learning client abstraction",
+    "monai.optimizers.Novograd, LearningRateFinder",
+    "monai.handlers — TensorBoardStatsHandler, MLFlowHandler, CheckpointSaver, MetricsSaver",
+    "monai.visualize — CAM, GradCAM, GradCAMpp, matshow3d, blend_images"
+  ]
+}

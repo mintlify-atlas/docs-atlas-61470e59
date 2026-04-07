@@ -1,80 +1,297 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Train a 3D medical image segmentation model end-to-end using MONAI transforms, CacheDataset, UNet, DiceCELoss, and SlidingWindowInferer."
 ---
 
-## Get started in three steps
+This guide walks you through training a complete 3D segmentation pipeline using MONAI. You will download a real medical imaging dataset, define a preprocessing and augmentation pipeline, train a UNet, and run inference on a validation volume — all with real MONAI APIs.
 
-Get your documentation site running locally and make your first customization.
+**Goal:** Train a 3D volumetric segmentation model on the Medical Segmentation Decathlon spleen task.
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Install MONAI">
+    Install MONAI with the dependencies needed for this quickstart:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    pip install 'monai[nibabel,tqdm,ignite]'
+    ```
 
-### Step 2: Deploy your changes
+    Verify the installation:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    python -c "import monai; monai.config.print_config()"
+    ```
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Download sample data">
+    Use MONAI's `DecathlonDataset` to automatically download and extract the spleen segmentation dataset from the Medical Segmentation Decathlon. On first run this downloads approximately 1.5 GB.
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```python
+    from monai.apps import DecathlonDataset
 
-### Step 3: Go live
+    # Downloads to ./data/ on first run; uses cached data on subsequent runs
+    train_ds_raw = DecathlonDataset(
+        root_dir="./data",
+        task="Task09_Spleen",
+        section="training",
+        download=True,
+    )
+    val_ds_raw = DecathlonDataset(
+        root_dir="./data",
+        task="Task09_Spleen",
+        section="validation",
+        download=False,
+    )
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    print(f"Training samples: {len(train_ds_raw)}")
+    print(f"Validation samples: {len(val_ds_raw)}")
+    print(f"First sample keys: {train_ds_raw[0].keys()}")
+    ```
+
+    Each sample is a dictionary with `"image"` and `"label"` keys containing file paths. MONAI's dictionary-based transforms read these automatically.
+
+    <Note>
+      For a smaller download, use `MedNISTDataset` instead — a 2D classification dataset (64x64 images, ~60 MB) suitable for testing your setup quickly.
+
+      ```python
+      from monai.apps import MedNISTDataset
+      dataset = MedNISTDataset(root_dir="./data", section="training", download=True)
+      ```
+    </Note>
+  </Step>
+
+  <Step title="Define transforms pipeline">
+    Define separate transform pipelines for training (with augmentation) and validation (deterministic only). MONAI's dictionary-based transforms operate on named keys within each sample dictionary.
+
+    ```python
+    from monai.transforms import (
+        Compose,
+        LoadImaged,
+        EnsureChannelFirstd,
+        ScaleIntensityRanged,
+        CropForegroundd,
+        RandCropByPosNegLabeld,
+        RandFlipd,
+        RandRotate90d,
+        EnsureTyped,
+        Spacingd,
+        Orientationd,
+    )
+
+    # Shared preprocessing applied to both training and validation
+    base_transforms = [
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        # Resample to isotropic voxel spacing
+        Spacingd(
+            keys=["image", "label"],
+            pixdim=(1.5, 1.5, 2.0),
+            mode=("bilinear", "nearest"),
+        ),
+        # Reorient to standard RAS axes
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        # Clip and normalize HU values for CT (spleen window)
+        ScaleIntensityRanged(
+            keys=["image"],
+            a_min=-57,
+            a_max=164,
+            b_min=0.0,
+            b_max=1.0,
+            clip=True,
+        ),
+        # Remove background to reduce patch search space
+        CropForegroundd(keys=["image", "label"], source_key="image"),
+        EnsureTyped(keys=["image", "label"]),
+    ]
+
+    train_transforms = Compose(
+        base_transforms + [
+            # Randomly sample a 96^3 patch with balanced foreground/background
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=(96, 96, 96),
+                pos=1,
+                neg=1,
+                num_samples=4,
+                image_key="image",
+                image_threshold=0,
+            ),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+            RandRotate90d(keys=["image", "label"], prob=0.1, max_k=3),
+        ]
+    )
+
+    val_transforms = Compose(base_transforms)
+    ```
+  </Step>
+
+  <Step title="Create CacheDataset and DataLoader">
+    Wrap the raw dataset file lists with `CacheDataset` to cache preprocessed volumes in RAM after the first epoch, dramatically speeding up subsequent training epochs.
+
+    ```python
+    import torch
+    from monai.data import CacheDataset, DataLoader, list_data_collate
+
+    # Retrieve the underlying file-path dictionaries
+    train_files = train_ds_raw.data
+    val_files = val_ds_raw.data
+
+    train_ds = CacheDataset(
+        data=train_files,
+        transform=train_transforms,
+        cache_rate=1.0,   # Cache all samples; reduce if RAM is limited
+        num_workers=4,
+    )
+    val_ds = CacheDataset(
+        data=val_files,
+        transform=val_transforms,
+        cache_rate=1.0,
+        num_workers=4,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=2,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=list_data_collate,
+        pin_memory=torch.cuda.is_available(),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        num_workers=4,
+        collate_fn=list_data_collate,
+    )
+    ```
+
+    <Tip>
+      Set `cache_rate=0.0` to disable caching during initial experimentation, then increase it once your pipeline is working. Use `PersistentDataset` instead of `CacheDataset` to cache to disk and survive Python restarts.
+    </Tip>
+  </Step>
+
+  <Step title="Build model, loss function, and optimizer">
+    Instantiate a 3D UNet, the combined Dice and cross-entropy loss, and an Adam optimizer.
+
+    ```python
+    import torch
+    from monai.networks.nets import UNet
+    from monai.networks.layers import Norm
+    from monai.losses import DiceCELoss
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = UNet(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=2,          # Background + spleen
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,
+        norm=Norm.BATCH,
+    ).to(device)
+
+    loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    ```
+  </Step>
+
+  <Step title="Run the training loop">
+    Train for a fixed number of epochs. Each batch from `train_loader` contains `num_samples=4` crops per volume due to `RandCropByPosNegLabeld`, so the effective batch size is `batch_size * num_samples = 8`.
+
+    ```python
+    max_epochs = 50
+    val_interval = 5   # Validate every 5 epochs
+
+    for epoch in range(max_epochs):
+        model.train()
+        epoch_loss = 0.0
+        step = 0
+
+        for batch in train_loader:
+            step += 1
+            inputs = batch["image"].to(device)
+            labels = batch["label"].to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_fn(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        epoch_loss /= step
+        print(f"Epoch {epoch + 1}/{max_epochs} — loss: {epoch_loss:.4f}")
+
+        # Save a checkpoint every val_interval epochs
+        if (epoch + 1) % val_interval == 0:
+            torch.save(model.state_dict(), f"checkpoint_epoch{epoch + 1}.pt")
+    ```
+  </Step>
+
+  <Step title="Run sliding window inference and evaluate">
+    Use `SlidingWindowInferer` to run inference on full volumes — it tiles the input into overlapping patches, runs the model on each, and stitches the predictions back together. Evaluate with `DiceMetric`.
+
+    ```python
+    import torch
+    from monai.inferers import SlidingWindowInferer
+    from monai.metrics import DiceMetric
+    from monai.transforms import AsDiscrete, Compose
+    from monai.data import decollate_batch
+
+    inferer = SlidingWindowInferer(
+        roi_size=(96, 96, 96),
+        sw_batch_size=4,
+        overlap=0.5,
+    )
+
+    post_pred = Compose([AsDiscrete(argmax=True, to_onehot=2)])
+    post_label = Compose([AsDiscrete(to_onehot=2)])
+
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+
+    model.eval()
+    with torch.no_grad():
+        for batch in val_loader:
+            inputs = batch["image"].to(device)
+            labels = batch["label"].to(device)
+
+            # Sliding window inference over the full volume
+            outputs = inferer(inputs, model)
+
+            # Convert raw logits and labels to one-hot predictions
+            outputs_list = decollate_batch(outputs)
+            labels_list = decollate_batch(labels)
+            outputs_converted = [post_pred(o) for o in outputs_list]
+            labels_converted = [post_label(l) for l in labels_list]
+
+            dice_metric(y_pred=outputs_converted, y=labels_converted)
+
+    mean_dice = dice_metric.aggregate().item()
+    dice_metric.reset()
+    print(f"Validation Mean Dice: {mean_dice:.4f}")
+    ```
+
+    A well-trained spleen segmentation model typically achieves a Mean Dice score above 0.94 on this dataset after 600+ epochs. For a quick smoke test, even 10 epochs should show the loss decreasing and a non-trivial Dice score.
+  </Step>
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Core concepts: transforms" icon="wand-magic-sparkles" href="/concepts/transforms">
+    Learn how MONAI's dictionary-based transforms work, how to compose them, and how to write custom transforms.
+  </Card>
+  <Card title="Datasets and data loading" icon="database" href="/concepts/datasets-and-dataloading">
+    Explore CacheDataset, PersistentDataset, SmartCacheDataset, and partition strategies for large datasets.
+  </Card>
+  <Card title="Networks and losses" icon="network-wired" href="/concepts/networks-and-losses">
+    Browse the full library of network architectures and loss functions available in MONAI.
+  </Card>
+  <Card title="Training workflows" icon="gear" href="/guides/workflows">
+    Use MONAI's SupervisedTrainer and handler system for structured, extensible training loops.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

@@ -1,0 +1,319 @@
+---
+title: 'Federated Learning'
+description: 'Train models across distributed sites without sharing raw patient data using MONAI bundles.'
+---
+
+Federated learning (FL) allows multiple institutions to collaboratively train a shared model without any site sending its raw data to a central server. Each client trains locally and shares only model weights (or weight differences) with a central aggregator. MONAI's FL support in `monai.fl` implements this pattern on top of MONAI Bundle workflows, making it straightforward to federate any existing bundle.
+
+<CardGroup cols={2}>
+  <Card title="Privacy-preserving" icon="shield">
+    Raw data never leaves the local site. Only model weight updates are exchanged, optionally filtered through differential privacy or encryption layers.
+  </Card>
+  <Card title="Bundle-native" icon="box">
+    `MonaiAlgo` wraps any MONAI Bundle, so the same `configs/train.json` used for centralized training can be used directly in federated experiments.
+  </Card>
+  <Card title="NVIDIA FLARE integration" icon="plug">
+    NVIDIA FLARE has built-in integration with `ClientAlgo`, providing a production-grade FL platform with minimal additional configuration.
+  </Card>
+  <Card title="Single and multi-GPU" icon="microchip">
+    `MonaiAlgo` supports both single-GPU and distributed multi-GPU training via PyTorch DDP through the same API.
+  </Card>
+</CardGroup>
+
+## Overview
+
+```
+                  FL Server (aggregator)
+                  ┌───────────────────┐
+                  │  global weights   │
+                  └─────┬──────┬──────┘
+             send        │      │         receive
+          global weights ▼      ▼       weight updates
+        ┌─────────────┐          ┌─────────────┐
+        │  Client A   │          │  Client B   │
+        │  (Hospital) │          │  (Hospital) │
+        │  MonaiAlgo  │          │  MonaiAlgo  │
+        └─────────────┘          └─────────────┘
+             local data               local data
+```
+
+Each client:
+1. Receives global weights from the server.
+2. Loads them into the local network (`train()`).
+3. Runs `local_epochs` of local training.
+4. Returns updated weights or weight differences (`get_weights()`).
+5. Optionally evaluates on local validation data (`evaluate()`).
+
+## ClientAlgo abstract base class
+
+`ClientAlgo` in `monai.fl.client` is the abstract interface that any FL client algorithm must implement. FL platforms (e.g., NVIDIA FLARE) interact exclusively through this interface.
+
+```python
+from monai.fl.client import ClientAlgo
+from monai.fl.utils.exchange_object import ExchangeObject
+
+class MyAlgo(ClientAlgo):
+    def train(self, data: ExchangeObject, extra: dict | None = None) -> None:
+        """
+        Receive global weights in `data.weights`, train locally,
+        update the local model in place.
+        """
+        ...
+
+    def get_weights(self, extra: dict | None = None) -> ExchangeObject:
+        """
+        Return current local weights (or weight differences) wrapped
+        in an ExchangeObject.
+        """
+        return ExchangeObject(
+            weights=self.network.state_dict(),
+            weight_type=WeightType.WEIGHTS,
+        )
+
+    def evaluate(self, data: ExchangeObject, extra: dict | None = None) -> ExchangeObject:
+        """
+        Load `data.weights` into the network, run evaluation,
+        return metrics in an ExchangeObject.
+        """
+        return ExchangeObject(metrics={"dice": 0.91})
+```
+
+Lifecycle methods `initialize()`, `abort()`, and `finalize()` are inherited from `BaseClient` and can optionally be overridden.
+
+## MonaiAlgo
+
+`MonaiAlgo` is MONAI's full implementation of `ClientAlgo` for MONAI Bundles. It reads a bundle's training and evaluation configs, manages the `SupervisedTrainer` and `SupervisedEvaluator` lifecycle, and handles weight exchange.
+
+### Constructor
+
+```python
+from monai.fl.client.monai_algo import MonaiAlgo
+
+algo = MonaiAlgo(
+    bundle_root="./spleen_ct_segmentation",
+    local_epochs=5,
+    config_train_filename="configs/train.json",
+    config_evaluate_filename="default",   # uses [train.json, evaluate.json]
+    send_weight_diff=True,                # send differences rather than full weights
+    disable_ckpt_loading=True,            # FL server controls weight loading
+    best_model_filepath="models/model.pt",
+    final_model_filepath="models/model_final.pt",
+)
+```
+
+<AccordionGroup>
+  <Accordion title="bundle_root">
+    Path to the MONAI Bundle directory. The FL platform's `app_root` (if provided via `extra` in `initialize()`) is prepended automatically.
+  </Accordion>
+  <Accordion title="local_epochs">
+    Number of training epochs to run during each FL round. The `SupervisedTrainer`'s `max_epochs` is updated accordingly before each `train()` call.
+  </Accordion>
+  <Accordion title="config_train_filename">
+    Path relative to `bundle_root` for the training config. Can be a list of files whose contents are merged. Defaults to `"configs/train.json"`.
+  </Accordion>
+  <Accordion title="config_evaluate_filename">
+    Path relative to `bundle_root` for the evaluation config. The special value `"default"` merges `["configs/train.json", "configs/evaluate.json"]`, which is the typical pattern in Model Zoo bundles.
+  </Accordion>
+  <Accordion title="send_weight_diff">
+    If `True` (default), `get_weights()` returns the difference between the current local weights and the global weights received at the start of the round. This reduces communication volume and is required for some secure aggregation schemes.
+  </Accordion>
+  <Accordion title="disable_ckpt_loading">
+    If `True` (default), any `CheckpointLoader` handlers defined in the bundle configs are disabled. The FL server is responsible for loading global weights via `train()`.
+  </Accordion>
+</AccordionGroup>
+
+### Methods
+
+#### `initialize(extra=None)`
+
+Parses the bundle configs, sets up `SupervisedTrainer` and `SupervisedEvaluator`, and attaches any stats sender. Must be called once before any other method.
+
+```python
+algo.initialize(extra={
+    "client_name": "hospital_a",
+    "app_root": "/fl_workspace",
+})
+```
+
+#### `train(data, extra=None)`
+
+Loads global weights from `data.weights` into the local network, runs `local_epochs` of training, and updates the internal model state.
+
+```python
+from monai.fl.utils.exchange_object import ExchangeObject
+from monai.fl.utils.constants import WeightType
+
+# Simulate receiving global weights from FL server
+global_data = ExchangeObject(
+    weights=global_model.state_dict(),
+    weight_type=WeightType.WEIGHTS,
+)
+algo.train(data=global_data)
+```
+
+#### `get_weights(extra=None)`
+
+Returns an `ExchangeObject` containing the current model weights (or weight differences if `send_weight_diff=True`). Optionally loads a saved checkpoint if `extra` contains a `ModelType` request.
+
+```python
+updated = algo.get_weights()
+print(updated.weight_type)   # WeightType.WEIGHT_DIFF or WeightType.WEIGHTS
+print(updated.statistics)    # training stats from the last round
+```
+
+#### `evaluate(data, extra=None)`
+
+Loads `data.weights` into the evaluator network and runs inference on the local validation set. Returns an `ExchangeObject` with `metrics`.
+
+```python
+eval_result = algo.evaluate(data=global_data)
+print(eval_result.metrics)   # {"val_mean_dice": 0.89, ...}
+```
+
+## MonaiAlgoStats
+
+`MonaiAlgoStats` implements `ClientAlgoStats` to compute summary data statistics (intensity histograms, image shapes, label distributions) on the local dataset. These statistics can be shared with the FL server for visualization and protocol design without sharing raw images.
+
+```python
+from monai.fl.client.monai_algo import MonaiAlgoStats
+
+stats_client = MonaiAlgoStats(
+    bundle_root="./spleen_ct_segmentation",
+    config_train_filename="configs/train.json",
+    histogram_only=False,
+)
+stats_client.initialize(extra={"client_name": "hospital_a"})
+
+from monai.fl.utils.constants import FlStatistics
+result = stats_client.get_data_stats(extra={
+    FlStatistics.HIST_BINS: 20,
+    FlStatistics.HIST_RANGE: [-1000, 1000],
+})
+print(result.statistics)   # {"train": {...}, "eval": {...}, "total": {...}}
+```
+
+`MonaiAlgo` inherits from `MonaiAlgoStats`, so any `MonaiAlgo` instance also supports `get_data_stats()`.
+
+## Integration with NVIDIA FLARE
+
+NVIDIA FLARE provides the server-side aggregation and coordination logic. MONAI's `ClientAlgo` is the client-side interface that FLARE calls.
+
+<Steps>
+  <Step title="Install FLARE">
+    ```bash
+    pip install nvflare
+    ```
+  </Step>
+  <Step title="Configure the FLARE executor">
+    In your FLARE application config, point the executor to `MonaiAlgo`:
+
+    ```json
+    {
+      "executors": [
+        {
+          "tasks": ["train", "get_weights", "evaluate"],
+          "executor": {
+            "path": "monai.fl.client.monai_algo.MonaiAlgo",
+            "args": {
+              "bundle_root": "spleen_ct_segmentation",
+              "local_epochs": 5,
+              "config_train_filename": "configs/train.json",
+              "send_weight_diff": true
+            }
+          }
+        }
+      ]
+    }
+    ```
+  </Step>
+  <Step title="Run the FL experiment">
+    ```bash
+    # Start the FL server
+    nvflare simulator ./fl_workspace -n 2 -t 2
+    ```
+
+    FLARE handles server-side aggregation (e.g., FedAvg) and orchestrates calls to `initialize()`, `train()`, `get_weights()`, and `evaluate()` on each client.
+  </Step>
+</Steps>
+
+## Single-GPU and multi-GPU training
+
+`MonaiAlgo` supports multi-GPU training automatically when `torch.distributed` is initialized. The `_set_cuda_device()` internal method sets the correct CUDA device from `LOCAL_RANK` when DDP is active.
+
+<Tabs>
+  <Tab title="Single GPU">
+    No special setup needed. `MonaiAlgo` uses whatever device the bundle config specifies.
+
+    ```python
+    algo = MonaiAlgo(bundle_root="./bundle", local_epochs=5)
+    algo.initialize()
+    algo.train(data=global_data)
+    ```
+  </Tab>
+  <Tab title="Multi-GPU (DDP)">
+    Launch with `torchrun` or your job scheduler. MONAI and FLARE handle device assignment.
+
+    ```bash
+    torchrun --nproc_per_node=4 fl_train.py
+    ```
+
+    ```python
+    # fl_train.py
+    import torch.distributed as dist
+    dist.init_process_group(backend="nccl")
+
+    algo = MonaiAlgo(bundle_root="./bundle", local_epochs=5)
+    algo.initialize()
+    algo.train(data=global_data)
+    weights = algo.get_weights()
+    ```
+
+    The bundle's `train.json` should configure `DistributedDataParallel` as it would for standard distributed training.
+  </Tab>
+</Tabs>
+
+## Full client setup example
+
+```python
+from monai.fl.client.monai_algo import MonaiAlgo
+from monai.fl.utils.exchange_object import ExchangeObject
+from monai.fl.utils.constants import WeightType, ExtraItems
+import torch
+
+# 1. Set up the algo
+algo = MonaiAlgo(
+    bundle_root="./spleen_ct_segmentation",
+    local_epochs=3,
+    config_train_filename="configs/train.json",
+    send_weight_diff=True,
+    best_model_filepath="models/model.pt",
+)
+
+# 2. Initialize (parses configs, sets up trainer/evaluator)
+algo.initialize(extra={
+    ExtraItems.CLIENT_NAME: "hospital_a",
+    ExtraItems.APP_ROOT: "/fl_workspace",
+})
+
+# 3. Simulate receiving initial global weights
+initial_weights = ExchangeObject(
+    weights={k: v.clone() for k, v in algo.trainer.network.state_dict().items()},
+    weight_type=WeightType.WEIGHTS,
+)
+
+# 4. FL training loop (normally driven by the FL platform)
+for fl_round in range(10):
+    print(f"Round {fl_round + 1}")
+    algo.train(data=initial_weights)
+    updated = algo.get_weights()
+    eval_result = algo.evaluate(data=initial_weights)
+    print(f"  Metrics: {eval_result.metrics}")
+    # In real FL, send `updated` to server and receive new `initial_weights`
+
+# 5. Clean up
+algo.finalize()
+```
+
+<Warning>
+In production FL deployments, weight exchange between client and server should use the FL platform's secure channels. Never implement your own weight transmission for patient data contexts.
+</Warning>

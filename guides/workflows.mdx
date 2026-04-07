@@ -1,0 +1,456 @@
+---
+title: "Workflows"
+description: "Build supervised training and evaluation pipelines with SupervisedTrainer, SupervisedEvaluator, and EnsembleEvaluator from monai.engines."
+keywords: ["training", "evaluation", "SupervisedTrainer", "SupervisedEvaluator", "EnsembleEvaluator", "ignite", "handlers"]
+---
+
+## Overview
+
+`monai.engines` provides a set of workflow classes that wrap [pytorch-ignite](https://pytorch.org/ignite/) `Engine` with
+medical-imaging-specific defaults. The class hierarchy is:
+
+```
+ignite.Engine
+  └── Workflow          (monai.engines.workflow)
+        ├── Trainer
+        │     ├── SupervisedTrainer
+        │     ├── GanTrainer
+        │     └── AdversarialTrainer
+        └── Evaluator
+              ├── SupervisedEvaluator
+              └── EnsembleEvaluator
+```
+
+`Workflow` owns all shared state—device placement, the data loader, AMP scaler, metric comparison, handler registration,
+and the `decollate_batch` step—so every subclass inherits consistent behaviour without repeating boilerplate.
+
+<CardGroup cols={2}>
+  <Card title="SupervisedTrainer" icon="dumbbell">
+    Standard image-label training with one network, one optimizer, and one loss.
+  </Card>
+  <Card title="SupervisedEvaluator" icon="flask">
+    Evaluation counterpart: runs the network in `eval` mode and accumulates metrics.
+  </Card>
+  <Card title="EnsembleEvaluator" icon="layer-group">
+    Runs multiple networks over the same batch and stores each prediction under a separate key.
+  </Card>
+  <Card title="GanTrainer / AdversarialTrainer" icon="shuffle">
+    Adversarial training loops with generator and discriminator networks.
+  </Card>
+</CardGroup>
+
+---
+
+## SupervisedTrainer
+
+### Constructor arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `device` | `str \| torch.device` | — | Target compute device (`"cuda:0"`, `"cpu"`, …). |
+| `max_epochs` | `int` | — | Total number of training epochs. |
+| `train_data_loader` | `Iterable \| DataLoader` | — | Source of training batches. |
+| `network` | `torch.nn.Module` | — | Model to train. |
+| `optimizer` | `Optimizer` | — | PyTorch optimizer. |
+| `loss_function` | `Callable` | — | Loss module; must return a scalar or batch tensor whose `.mean()` is taken. |
+| `epoch_length` | `int \| None` | `len(loader)` | Iterations per epoch; inferred automatically when possible. |
+| `non_blocking` | `bool` | `False` | Asynchronous host→device copy when `True`. |
+| `prepare_batch` | `Callable` | `default_prepare_batch` | Extracts `(inputs, targets)` from each batch dict. |
+| `iteration_update` | `Callable \| None` | `None` | Replaces the built-in `_iteration` loop entirely. |
+| `inferer` | `Inferer \| None` | `SimpleInferer()` | Controls how the forward pass is executed (e.g. sliding window). |
+| `postprocessing` | `Transform \| None` | `None` | Applied to model output after `decollate_batch`. |
+| `key_train_metric` | `dict[str, Metric] \| None` | `None` | Primary ignite metric; used for checkpoint comparison. |
+| `additional_metrics` | `dict[str, Metric] \| None` | `None` | Extra ignite metrics attached to the engine. |
+| `train_handlers` | `Sequence \| None` | `None` | List of event handlers (see below). |
+| `amp` | `bool` | `False` | Enable automatic mixed precision via `torch.cuda.amp`. |
+| `decollate` | `bool` | `True` | Decollate batch-first tensors into per-sample lists after forward. |
+| `optim_set_to_none` | `bool` | `False` | Pass `set_to_none=True` to `optimizer.zero_grad()` for a small speed gain. |
+| `compile` | `bool` | `False` | Wrap the network with `torch.compile` before training. |
+| `accumulation_steps` | `int` | `1` | Number of mini-batches over which to accumulate gradients. |
+
+### What happens each iteration
+
+Each call to `_iteration` runs the following sequence:
+
+<Steps>
+  <Step title="Prepare batch">
+    `prepare_batch` moves `image` and `label` tensors to the target device.
+  </Step>
+  <Step title="Zero gradients (when due)">
+    `optimizer.zero_grad()` is called at the start of each accumulation window.
+  </Step>
+  <Step title="Forward pass">
+    `inferer(inputs, network)` computes the prediction and fires `FORWARD_COMPLETED`.
+  </Step>
+  <Step title="Loss computation">
+    `loss_function(pred, targets).mean()` is computed and `LOSS_COMPLETED` fires.
+  </Step>
+  <Step title="Backward pass">
+    `loss.backward()` (or scaled backward with AMP). `BACKWARD_COMPLETED` fires.
+  </Step>
+  <Step title="Optimizer step (when due)">
+    `optimizer.step()` is called at the end of each accumulation window.
+  </Step>
+  <Step title="Post-iteration events">
+    `MODEL_COMPLETED` fires, then `decollate_batch` and `postprocessing` run.
+  </Step>
+</Steps>
+
+### Gradient accumulation
+
+Set `accumulation_steps > 1` to simulate a larger effective batch size when GPU memory is limited.
+The stored loss value is always the **unscaled** per-mini-batch loss. At the end of each epoch,
+MONAI performs a flush step if the epoch length is not evenly divisible by `accumulation_steps`
+so no gradients are silently discarded.
+
+```python
+trainer = SupervisedTrainer(
+    device=torch.device("cuda:0"),
+    max_epochs=200,
+    train_data_loader=train_loader,
+    network=model,
+    optimizer=optimizer,
+    loss_function=loss_fn,
+    accumulation_steps=4,   # effective batch = batch_size * 4
+    amp=True,
+)
+```
+
+---
+
+## Event handler system
+
+Handlers are ordinary Python objects with an `attach(engine)` method. Pass them as a list to
+`train_handlers` (or `val_handlers` for evaluators). MONAI ships a broad set in `monai.handlers`:
+
+<AccordionGroup>
+  <Accordion title="Checkpointing">
+    **`CheckpointSaver`** – saves model/optimizer/scaler state dicts to disk whenever the key metric
+    improves or at a fixed epoch interval.
+
+    **`CheckpointLoader`** – restores a checkpoint at engine startup; useful for resuming interrupted runs.
+  </Accordion>
+
+  <Accordion title="Logging">
+    **`StatsHandler`** – prints loss and metrics to stdout/logger after each epoch or iteration.
+
+    **`LogfileHandler`** – writes the same information to a log file.
+
+    **`MetricLogger`** – stores per-iteration metrics in-memory for later inspection.
+  </Accordion>
+
+  <Accordion title="TensorBoard">
+    **`TensorBoardStatsHandler`** – writes scalar metrics to a TensorBoard `SummaryWriter`.
+
+    **`TensorBoardImageHandler`** – writes image grids (input, label, prediction) to TensorBoard.
+  </Accordion>
+
+  <Accordion title="Validation">
+    **`ValidationHandler`** – triggers a `SupervisedEvaluator` at the end of every N training epochs.
+  </Accordion>
+
+  <Accordion title="Learning rate scheduling">
+    **`LrScheduleHandler`** – wraps any `torch.optim.lr_scheduler` and steps it at epoch or iteration end.
+
+    **`ParamSchedulerHandler`** – schedules any attribute of any object on a user-defined curve.
+  </Accordion>
+
+  <Accordion title="Early stopping">
+    **`EarlyStopHandler`** – watches a metric and stops training when it stops improving.
+  </Accordion>
+
+  <Accordion title="MLflow">
+    **`MLFlowHandler`** – logs metrics, parameters, and artifacts to an MLflow tracking server.
+  </Accordion>
+
+  <Accordion title="NVTX profiling">
+    **`RangeHandler`**, **`MarkHandler`** – insert NVTX markers around engine events for Nsight profiling.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## SupervisedEvaluator
+
+`SupervisedEvaluator` mirrors `SupervisedTrainer` but runs the network in `eval` mode (no gradients)
+and does not maintain an optimizer. It is always a single-epoch engine; the global epoch counter from
+the trainer is passed in via `run(global_epoch=...)`.
+
+```python
+from monai.engines import SupervisedEvaluator
+from monai.inferers import SlidingWindowInferer
+from monai.handlers import MeanDice, StatsHandler
+
+evaluator = SupervisedEvaluator(
+    device=torch.device("cuda:0"),
+    val_data_loader=val_loader,
+    network=model,
+    inferer=SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4),
+    postprocessing=val_post_transforms,
+    key_val_metric={"val_mean_dice": MeanDice(include_background=False, output_transform=from_engine(["pred", "label"]))},
+    val_handlers=[StatsHandler(output_transform=lambda x: None)],
+    amp=True,
+)
+```
+
+---
+
+## EnsembleEvaluator
+
+`EnsembleEvaluator` accepts a **list** of trained networks and runs each one on every batch, storing
+each prediction under a distinct key. This is the building block for cross-validation model ensembles.
+
+```python
+from monai.engines import EnsembleEvaluator
+from monai.transforms import MeanEnsemble, VoteEnsemble
+
+ensemble_eval = EnsembleEvaluator(
+    device=torch.device("cuda:0"),
+    val_data_loader=test_loader,
+    networks=[model_fold0, model_fold1, model_fold2, model_fold3, model_fold4],
+    pred_keys=["pred_0", "pred_1", "pred_2", "pred_3", "pred_4"],
+    inferer=SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4),
+    postprocessing=ensemble_post_transforms,  # includes MeanEnsemble or VoteEnsemble
+)
+```
+
+### Cross-validation ensemble pattern
+
+<Steps>
+  <Step title="Partition the dataset">
+    Use `monai.data.partition_dataset` to split into K folds with reproducible shuffling.
+  </Step>
+  <Step title="Train K models">
+    Train one `SupervisedTrainer` per fold, each holding out a different validation split.
+  </Step>
+  <Step title="Collect checkpoints">
+    Load each fold's best checkpoint into a separate network instance.
+  </Step>
+  <Step title="Run EnsembleEvaluator">
+    Pass all K networks to `EnsembleEvaluator`; each network produces a `pred_k` key.
+  </Step>
+  <Step title="Aggregate predictions">
+    Apply `MeanEnsemble` (soft average) or `VoteEnsemble` (majority vote) as a postprocessing transform.
+  </Step>
+</Steps>
+
+---
+
+## decollate_batch
+
+### What it does
+
+During training and evaluation, `engine.state.batch` and `engine.state.output` are
+**batch-first** tensors, e.g. shape `[B, C, H, W, D]`.
+After the forward pass, `decollate_batch` splits these into a **Python list** of B independent
+channel-first tensors, each of shape `[C, H, W, D]`.
+
+### Why it matters
+
+<CardGroup cols={2}>
+  <Card title="Per-sample postprocessing" icon="scissors">
+    Randomised transforms (e.g. random test-time augmentation) can be applied differently to each
+    sample in the batch because they are now independent list elements.
+  </Card>
+  <Card title="Simplified transform APIs" icon="minimize">
+    MONAI transforms expect channel-first input. After decollation, every transform in the
+    postprocessing pipeline sees a single-sample tensor without needing batch-awareness.
+  </Card>
+  <Card title="Invertible transforms" icon="rotate-ccw">
+    `Invertd` can invert each sample's preprocessing independently, even when samples have
+    different shapes (impossible if still stacked in a batch tensor).
+  </Card>
+  <Card title="Flexible metric computation" icon="chart-bar">
+    Metrics in `monai.metrics` accept either a batch tensor or a list of channel-first tensors,
+    giving you flexibility in how you feed predictions.
+  </Card>
+</CardGroup>
+
+### Code example
+
+```python
+from monai.data import decollate_batch
+from monai.transforms import Compose, Activationsd, AsDiscreted, Invertd
+
+# postprocessing applied per-sample after decollation
+post_transforms = Compose([
+    Activationsd(keys="pred", softmax=True),
+    AsDiscreted(keys="pred", argmax=True, to_onehot=3),
+    Invertd(keys="pred", transform=train_transforms, orig_keys="image"),
+])
+
+# inside an evaluation loop (handled automatically by SupervisedEvaluator):
+outputs = decollate_batch(engine.state.output)   # list of dicts
+for output in outputs:
+    output = post_transforms(output)
+    dice_metric(y_pred=output["pred"], y=output["label"])
+```
+
+<Note>
+  `decollate=True` is the default in both `SupervisedTrainer` and `SupervisedEvaluator`.
+  Set it to `False` only if you are providing a fully custom `iteration_update` that handles
+  batch-first data throughout.
+</Note>
+
+---
+
+## Integration with PyTorch Lightning and MLflow
+
+MONAI modules are plain PyTorch and work outside `monai.engines`. For Lightning:
+
+```python
+import lightning as L
+from monai.networks.nets import UNet
+from monai.losses import DiceLoss
+from monai.inferers import SlidingWindowInferer
+
+class SegmentationModule(L.LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.network = UNet(spatial_dims=3, in_channels=1, out_channels=2,
+                            channels=(16, 32, 64, 128), strides=(2, 2, 2))
+        self.loss_fn = DiceLoss(softmax=True)
+        self.inferer = SlidingWindowInferer(roi_size=(96, 96, 96), sw_batch_size=4)
+
+    def training_step(self, batch, batch_idx):
+        images, labels = batch["image"], batch["label"]
+        outputs = self.network(images)
+        loss = self.loss_fn(outputs, labels)
+        self.log("train_loss", loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, labels = batch["image"], batch["label"]
+        outputs = self.inferer(images, self.network)
+        # compute and log metrics ...
+```
+
+For MLflow, attach `MLFlowHandler` to the engine's handler list:
+
+```python
+from monai.handlers import MLFlowHandler
+
+mlflow_handler = MLFlowHandler(
+    tracking_uri="http://localhost:5000",
+    experiment_name="spleen_segmentation",
+    output_transform=lambda x: {"train_loss": x[0]["loss"]},
+)
+trainer = SupervisedTrainer(..., train_handlers=[..., mlflow_handler])
+```
+
+---
+
+## Full working example
+
+```python
+import torch
+from torch.utils.data import DataLoader
+from monai.engines import SupervisedTrainer, SupervisedEvaluator
+from monai.handlers import (
+    CheckpointSaver,
+    LrScheduleHandler,
+    MeanDice,
+    StatsHandler,
+    TensorBoardStatsHandler,
+    ValidationHandler,
+    from_engine,
+)
+from monai.inferers import SlidingWindowInferer
+from monai.losses import DiceCELoss
+from monai.networks.nets import UNet
+from monai.transforms import (
+    Activationsd, AsDiscreted, Compose, EnsureChannelFirstd,
+    LoadImaged, NormalizeIntensityd, Orientationd, RandCropByPosNegLabeld,
+    Spacingd, ToTensord,
+)
+from monai.data import CacheDataset, decollate_batch, partition_dataset
+
+# ── Data ────────────────────────────────────────────────────────────────────
+data_dicts = [{"image": img, "label": lbl} for img, lbl in zip(image_files, label_files)]
+train_files, val_files = data_dicts[:-20], data_dicts[-20:]
+
+train_transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+    NormalizeIntensityd(keys="image"),
+    RandCropByPosNegLabeld(keys=["image", "label"], label_key="label",
+                           spatial_size=(96, 96, 64), pos=1, neg=1, num_samples=4),
+])
+
+val_transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+    NormalizeIntensityd(keys="image"),
+])
+
+train_ds = CacheDataset(data=train_files, transform=train_transforms, cache_rate=1.0, num_workers=4)
+val_ds   = CacheDataset(data=val_files,   transform=val_transforms,   cache_rate=1.0, num_workers=4)
+train_loader = DataLoader(train_ds, batch_size=2, shuffle=True,  num_workers=2)
+val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=2)
+
+# ── Model and optimiser ──────────────────────────────────────────────────────
+device = torch.device("cuda:0")
+model  = UNet(spatial_dims=3, in_channels=1, out_channels=2,
+              channels=(16, 32, 64, 128, 256), strides=(2, 2, 2, 2)).to(device)
+optimizer  = torch.optim.Adam(model.parameters(), lr=1e-4)
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+loss_fn    = DiceCELoss(to_onehot_y=True, softmax=True)
+
+# ── Post-processing ──────────────────────────────────────────────────────────
+val_post = Compose([
+    Activationsd(keys="pred", softmax=True),
+    AsDiscreted(keys=["pred", "label"], argmax=[True, False], to_onehot=2),
+])
+
+# ── Evaluator ────────────────────────────────────────────────────────────────
+evaluator = SupervisedEvaluator(
+    device=device,
+    val_data_loader=val_loader,
+    network=model,
+    inferer=SlidingWindowInferer(roi_size=(96, 96, 64), sw_batch_size=4, overlap=0.5),
+    postprocessing=val_post,
+    key_val_metric={
+        "val_mean_dice": MeanDice(
+            include_background=False,
+            output_transform=from_engine(["pred", "label"]),
+        )
+    },
+    val_handlers=[StatsHandler(output_transform=lambda x: None)],
+    amp=True,
+)
+
+# ── Trainer ──────────────────────────────────────────────────────────────────
+trainer = SupervisedTrainer(
+    device=device,
+    max_epochs=200,
+    train_data_loader=train_loader,
+    network=model,
+    optimizer=optimizer,
+    loss_function=loss_fn,
+    inferer=SlidingWindowInferer(roi_size=(96, 96, 64), sw_batch_size=4),
+    amp=True,
+    train_handlers=[
+        ValidationHandler(validator=evaluator, interval=1, epoch_level=True),
+        LrScheduleHandler(lr_scheduler=lr_scheduler, print_lr=True),
+        CheckpointSaver(
+            save_dir="./checkpoints",
+            save_dict={"net": model, "optimizer": optimizer},
+            save_key_metric=True,
+        ),
+        StatsHandler(tag_name="train_loss", output_transform=from_engine(["loss"], first=True)),
+        TensorBoardStatsHandler(
+            log_dir="./runs",
+            tag_name="train_loss",
+            output_transform=from_engine(["loss"], first=True),
+        ),
+    ],
+)
+
+trainer.run()
+print(f"Best validation Dice: {evaluator.state.best_metric:.4f} "
+      f"at epoch {evaluator.state.best_metric_epoch}")
+```

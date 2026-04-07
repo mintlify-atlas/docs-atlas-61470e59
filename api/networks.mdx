@@ -1,0 +1,553 @@
+---
+title: 'monai.networks.nets'
+description: 'Neural network architectures for segmentation, classification, detection, and generative modeling in medical imaging.'
+---
+
+The `monai.networks.nets` module provides a curated collection of neural network architectures for medical imaging tasks. All networks are implemented as standard `torch.nn.Module` classes.
+
+## Segmentation: UNet family
+
+### UNet
+
+Configurable encoder–decoder network with skip connections. Supports 2D and 3D images.
+
+```python
+from monai.networks.nets import UNet
+
+model = UNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=2,
+    channels=(16, 32, 64, 128, 256),
+    strides=(2, 2, 2, 2),
+    num_res_units=2,
+)
+```
+
+<ParamField path="spatial_dims" type="int" required>
+  Number of spatial dimensions: `2` or `3`.
+</ParamField>
+
+<ParamField path="in_channels" type="int" required>
+  Number of input image channels.
+</ParamField>
+
+<ParamField path="out_channels" type="int" required>
+  Number of output segmentation classes.
+</ParamField>
+
+<ParamField path="channels" type="Sequence[int]" required>
+  Feature channel counts at each encoder level.
+</ParamField>
+
+<ParamField path="strides" type="Sequence[int]" required>
+  Downsampling strides at each encoder level. `len(strides)` must equal `len(channels) - 1`.
+</ParamField>
+
+<ParamField path="num_res_units" type="int" default="0">
+  Number of residual units per block.
+</ParamField>
+
+---
+
+### BasicUNet
+
+Lightweight U-Net with fixed architecture, suitable as a fast baseline.
+
+```python
+from monai.networks.nets import BasicUNet
+
+model = BasicUNet(spatial_dims=3, in_channels=1, out_channels=2, features=(32, 32, 64, 128, 256, 32))
+```
+
+<ParamField path="features" type="Sequence[int]" default="(32, 32, 64, 128, 256, 32)">
+  Feature sizes for each stage plus the final upsampling block.
+</ParamField>
+
+---
+
+### DynUNet
+
+Dynamic U-Net adapted from the nnU-Net framework. Supports deep supervision and anisotropic kernels.
+
+```python
+from monai.networks.nets import DynUNet
+
+model = DynUNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=2,
+    kernel_size=[[3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3]],
+    strides=[[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2]],
+    upsample_kernel_size=[[2, 2, 2], [2, 2, 2], [2, 2, 2]],
+    deep_supervision=True,
+    deep_supr_num=2,
+)
+```
+
+<ParamField path="kernel_size" type="Sequence[Sequence[int]]" required>
+  Kernel sizes per encoder level.
+</ParamField>
+
+<ParamField path="strides" type="Sequence[Sequence[int]]" required>
+  Strides per encoder level.
+</ParamField>
+
+<ParamField path="upsample_kernel_size" type="Sequence[Sequence[int]]" required>
+  Upsampling kernel sizes for each decoder level.
+</ParamField>
+
+<ParamField path="deep_supervision" type="bool" default="False">
+  Enable deep supervision auxiliary outputs.
+</ParamField>
+
+---
+
+### SegResNet
+
+Residual encoder–decoder network for volumetric segmentation. Offers a VAE variant for regularization.
+
+```python
+from monai.networks.nets import SegResNet
+
+model = SegResNet(
+    spatial_dims=3,
+    in_channels=4,
+    out_channels=3,
+    init_filters=32,
+    dropout_prob=0.2,
+)
+```
+
+<ParamField path="init_filters" type="int" default="8">
+  Number of filters in the first encoder block.
+</ParamField>
+
+<ParamField path="dropout_prob" type="float | None" default="None">
+  Dropout probability applied inside encoder blocks.
+</ParamField>
+
+**Variant**: `SegResNetVAE` — adds a VAE branch for distribution-level regularization.
+
+---
+
+### SegResNetDS
+
+`SegResNet` with deep supervision, designed for multi-scale prediction.
+
+---
+
+### AttentionUnet
+
+U-Net with attention gates in skip connections to focus on relevant foreground structures.
+
+```python
+from monai.networks.nets import AttentionUnet
+
+model = AttentionUnet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=2,
+    channels=(32, 64, 128, 256),
+    strides=(2, 2, 2),
+    dropout=0.1,
+)
+```
+
+---
+
+### VNet
+
+Volumetric fully-convolutional network from the V-Net paper, with residual blocks and PReLU activations.
+
+```python
+from monai.networks.nets import VNet
+
+model = VNet(spatial_dims=3, in_channels=1, out_channels=2)
+```
+
+---
+
+### HighResNet
+
+High-resolution network using dilated convolutions for multi-scale feature extraction without downsampling.
+
+---
+
+## Segmentation: transformer-based
+
+### SwinUNETR
+
+Swin Transformer encoder + CNN decoder for volumetric segmentation. State-of-the-art on BraTS and other benchmarks.
+
+```python
+from monai.networks.nets import SwinUNETR
+
+model = SwinUNETR(
+    in_channels=4,
+    out_channels=3,
+    feature_size=48,
+    use_checkpoint=True,
+    spatial_dims=3,
+)
+```
+
+<ParamField path="in_channels" type="int" required>
+  Number of input channels.
+</ParamField>
+
+<ParamField path="out_channels" type="int" required>
+  Number of output segmentation classes.
+</ParamField>
+
+<ParamField path="feature_size" type="int" default="24">
+  Base feature dimension of the Swin Transformer.
+</ParamField>
+
+<ParamField path="patch_size" type="int" default="2">
+  Patch token size used in patch embedding.
+</ParamField>
+
+<ParamField path="depths" type="Sequence[int]" default="(2, 2, 2, 2)">
+  Number of Swin Transformer blocks per stage.
+</ParamField>
+
+<ParamField path="num_heads" type="Sequence[int]" default="(3, 6, 12, 24)">
+  Number of attention heads per stage.
+</ParamField>
+
+<ParamField path="window_size" type="int | Sequence[int]" default="7">
+  Local attention window size.
+</ParamField>
+
+<ParamField path="spatial_dims" type="int" default="3">
+  Number of spatial dimensions: `2` or `3`.
+</ParamField>
+
+<ParamField path="use_checkpoint" type="bool" default="False">
+  Use gradient checkpointing to reduce GPU memory usage.
+</ParamField>
+
+<ParamField path="use_v2" type="bool" default="False">
+  Use SwinUNETR v2 with residual convolution blocks in the decoder.
+</ParamField>
+
+---
+
+### UNETR
+
+UNEt TRansformers: ViT encoder + CNN decoder for 3D medical image segmentation.
+
+```python
+from monai.networks.nets import UNETR
+
+model = UNETR(
+    in_channels=1,
+    out_channels=14,
+    img_size=(96, 96, 96),
+    feature_size=16,
+    hidden_size=768,
+    mlp_dim=3072,
+    num_heads=12,
+)
+```
+
+<ParamField path="img_size" type="Sequence[int] | int" required>
+  Input image size.
+</ParamField>
+
+<ParamField path="hidden_size" type="int" default="768">
+  Transformer hidden dimension.
+</ParamField>
+
+<ParamField path="mlp_dim" type="int" default="3072">
+  MLP intermediate dimension within transformer blocks.
+</ParamField>
+
+<ParamField path="num_heads" type="int" default="12">
+  Number of multi-head attention heads.
+</ParamField>
+
+---
+
+## Classification networks
+
+### ResNet variants
+
+Standard ResNet backbones adapted for 3D medical images.
+
+```python
+from monai.networks.nets import resnet10, resnet18, resnet50
+
+model = resnet50(spatial_dims=3, n_input_channels=1, num_classes=2)
+```
+
+Available factory functions: `resnet10`, `resnet18`, `resnet34`, `resnet50`, `resnet101`, `resnet152`, `resnet200`.
+
+<ParamField path="spatial_dims" type="int" default="3">
+  Number of spatial dimensions.
+</ParamField>
+
+<ParamField path="n_input_channels" type="int" default="3">
+  Number of input channels.
+</ParamField>
+
+<ParamField path="num_classes" type="int" default="400">
+  Number of output classes.
+</ParamField>
+
+---
+
+### DenseNet variants
+
+Dense connectivity networks for classification and segmentation.
+
+```python
+from monai.networks.nets import densenet121
+
+model = densenet121(spatial_dims=3, in_channels=1, out_channels=2)
+```
+
+Available factory functions: `densenet121`, `densenet169`, `densenet201`, `densenet264`.
+
+<ParamField path="init_features" type="int" default="64">
+  Number of feature maps in the initial convolution.
+</ParamField>
+
+<ParamField path="growth_rate" type="int" default="32">
+  Number of feature maps added per dense layer.
+</ParamField>
+
+---
+
+### EfficientNet
+
+EfficientNet-B0 through B7, with optional ImageNet pretraining support.
+
+```python
+from monai.networks.nets import EfficientNetBN
+
+model = EfficientNetBN("efficientnet-b0", spatial_dims=2, in_channels=1, num_classes=6)
+```
+
+---
+
+### SENet variants
+
+Squeeze-and-Excitation networks for channel attention. Available as `senet154`, `seresnet50`, `seresnet101`, `seresnet152`, `seresnext50`, `seresnext101`.
+
+---
+
+## Vision transformers
+
+### ViT
+
+Standard Vision Transformer for medical image analysis.
+
+```python
+from monai.networks.nets import ViT
+
+model = ViT(
+    in_channels=1,
+    img_size=(96, 96, 96),
+    patch_size=(16, 16, 16),
+    hidden_size=768,
+    mlp_dim=3072,
+    num_layers=12,
+    num_heads=12,
+    num_classes=2,
+)
+```
+
+<ParamField path="patch_size" type="Sequence[int] | int" required>
+  Size of each image patch token.
+</ParamField>
+
+<ParamField path="hidden_size" type="int" default="768">
+  Embedding dimension.
+</ParamField>
+
+<ParamField path="num_layers" type="int" default="12">
+  Number of transformer encoder blocks.
+</ParamField>
+
+---
+
+### MaskedAutoEncoderViT
+
+ViT with masked autoencoding (MAE) pretraining support.
+
+```python
+from monai.networks.nets import MaskedAutoEncoderViT
+
+model = MaskedAutoEncoderViT(
+    in_channels=1,
+    img_size=224,
+    patch_size=16,
+    hidden_size=768,
+    num_layers=12,
+    num_heads=12,
+    masking_ratio=0.75,
+)
+```
+
+---
+
+### ViTAutoEnc
+
+ViT-based autoencoder for self-supervised pretraining.
+
+---
+
+## Generative models
+
+### DiffusionModelUNet
+
+U-Net for denoising diffusion probabilistic models (DDPM). Accepts noise level conditioning via timestep embeddings.
+
+```python
+from monai.networks.nets import DiffusionModelUNet
+
+model = DiffusionModelUNet(
+    spatial_dims=2,
+    in_channels=1,
+    out_channels=1,
+    num_channels=(128, 256, 512),
+    attention_levels=(False, True, True),
+    num_head_channels=(0, 256, 512),
+    num_res_blocks=2,
+)
+```
+
+<ParamField path="num_channels" type="Sequence[int]" required>
+  Channel counts at each resolution level.
+</ParamField>
+
+<ParamField path="attention_levels" type="Sequence[bool]" required>
+  Whether to apply self-attention at each resolution level.
+</ParamField>
+
+<ParamField path="num_head_channels" type="int | Sequence[int]" required>
+  Attention head channels per level.
+</ParamField>
+
+---
+
+### AutoencoderKL
+
+Variational autoencoder with KL divergence regularization. Used as the latent space encoder/decoder in latent diffusion models.
+
+```python
+from monai.networks.nets import AutoencoderKL
+
+model = AutoencoderKL(
+    spatial_dims=2,
+    in_channels=1,
+    out_channels=1,
+    latent_channels=4,
+    num_channels=(128, 256),
+    num_res_blocks=2,
+    norm_num_groups=32,
+)
+```
+
+---
+
+### VQVAE
+
+Vector-Quantized VAE for discrete latent representations.
+
+```python
+from monai.networks.nets import VQVAE
+
+model = VQVAE(
+    spatial_dims=2,
+    in_channels=1,
+    out_channels=1,
+    num_channels=(256, 512),
+    num_res_layers=2,
+    num_embeddings=256,
+    embedding_dim=32,
+)
+```
+
+---
+
+## Pathology & specialized
+
+### HoVerNet
+
+Hover-Net for simultaneous nuclear instance segmentation and classification in histology images.
+
+```python
+from monai.networks.nets import HoVerNet
+
+model = HoVerNet(mode="fast", in_channels=3, num_classes=5)
+```
+
+<ParamField path="mode" type="str" default="fast">
+  `"fast"` (reduced encoder) or `"original"`.
+</ParamField>
+
+---
+
+### VISTA3D
+
+Interactive 3D segmentation network supporting both automatic and prompt-based segmentation.
+
+```python
+from monai.networks.nets import VISTA3D
+
+model = VISTA3D(encoder_embed_dim=48, encoder_depth=12, image_size=256)
+```
+
+---
+
+### DiNTS
+
+Differentiable Neural Network Topology Search for automated architecture search.
+
+---
+
+### MedNeXt
+
+Modern ConvNeXt-inspired network optimized for medical image segmentation.
+
+```python
+from monai.networks.nets import MedNeXt
+
+model = MedNeXt(
+    in_channels=1,
+    n_channels=32,
+    n_classes=2,
+    exp_r=2,
+    kernel_size=3,
+    deep_supervision=False,
+)
+```
+
+Available size variants: `MedNeXtS`, `MedNeXtM`, `MedNeXtB`, `MedNeXtL`.
+
+---
+
+### BasicUNetPlusPlus
+
+U-Net++ with nested skip connections for dense multi-scale feature aggregation.
+
+---
+
+### FlexibleUNet
+
+Pluggable U-Net where the encoder backbone is replaceable (EfficientNet, ResNet, etc.).
+
+```python
+from monai.networks.nets import FlexibleUNet
+
+model = FlexibleUNet(
+    in_channels=3,
+    out_channels=2,
+    backbone="efficientnet-b0",
+    pretrained=True,
+    spatial_dims=2,
+)
+```

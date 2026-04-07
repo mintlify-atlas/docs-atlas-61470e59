@@ -1,0 +1,335 @@
+---
+title: 'monai.metrics'
+description: 'Evaluation metrics for segmentation, classification, detection, and generative models in medical imaging.'
+---
+
+The `monai.metrics` module provides stateful evaluation metrics following a `compute()` / `aggregate()` workflow. Metrics accumulate per-iteration results across the full validation set, then compute the final aggregate at epoch end.
+
+## Usage pattern
+
+```python
+from monai.metrics import DiceMetric
+
+metric = DiceMetric(include_background=False, reduction="mean")
+
+# In validation loop:
+for batch in val_loader:
+    preds = model(batch["image"])
+    metric(y_pred=preds, y=batch["label"])   # accumulate
+
+# After all batches:
+score = metric.aggregate()   # compute final metric
+metric.reset()               # clear accumulated data for next epoch
+```
+
+## Segmentation metrics
+
+### DiceMetric
+
+Computes Dice Similarity Coefficient (DSC) for segmentation predictions. Supports multi-class and multi-label tasks.
+
+```python
+from monai.metrics import DiceMetric
+
+metric = DiceMetric(
+    include_background=False,
+    reduction="mean_batch",
+    get_not_nans=True,
+    ignore_empty=True,
+)
+
+metric(y_pred=predictions, y=targets)
+per_class_dice = metric.aggregate()   # shape: (num_classes,)
+metric.reset()
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  If `False`, excludes channel 0 (background) from the metric.
+</ParamField>
+
+<ParamField path="reduction" type="str" default="mean">
+  Aggregation strategy: `"none"`, `"mean"`, `"sum"`, `"mean_batch"`, `"sum_batch"`, `"mean_channel"`, `"sum_channel"`.
+</ParamField>
+
+<ParamField path="get_not_nans" type="bool" default="False">
+  If `True`, `aggregate()` returns `(metric, not_nans_count)` where `not_nans_count` indicates how many non-NaN values contributed.
+</ParamField>
+
+<ParamField path="ignore_empty" type="bool" default="True">
+  If `True`, return NaN for classes absent in both prediction and target (instead of 1.0).
+</ParamField>
+
+<ParamField path="num_classes" type="int | None">
+  Required when inputs are label maps (`B1HWD`) rather than one-hot (`BCHWD`).
+</ParamField>
+
+**Methods**:
+- `__call__(y_pred, y)` — accumulate batch results.
+- `aggregate()` — compute and return the aggregated metric.
+- `reset()` — clear accumulated buffers.
+
+---
+
+### HausdorffDistanceMetric
+
+Computes Hausdorff distance between predicted and ground truth segmentation boundaries.
+
+```python
+from monai.metrics import HausdorffDistanceMetric
+
+metric = HausdorffDistanceMetric(
+    include_background=False,
+    distance_metric="euclidean",
+    percentile=95,
+    directed=False,
+)
+
+metric(y_pred=predictions, y=targets)
+hd95 = metric.aggregate()
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Include background channel.
+</ParamField>
+
+<ParamField path="distance_metric" type="str" default="euclidean">
+  Distance function: `"euclidean"`, `"chessboard"`, `"taxicab"`.
+</ParamField>
+
+<ParamField path="percentile" type="float | None">
+  If set, computes the percentile Hausdorff distance (e.g., `95` for HD95).
+</ParamField>
+
+<ParamField path="directed" type="bool" default="False">
+  If `True`, computes directed Hausdorff distance from prediction to ground truth only.
+</ParamField>
+
+---
+
+### SurfaceDistanceMetric
+
+Computes average symmetric surface distance between prediction and ground truth boundaries.
+
+```python
+from monai.metrics import SurfaceDistanceMetric
+
+metric = SurfaceDistanceMetric(
+    include_background=False,
+    distance_metric="euclidean",
+    symmetric=True,
+)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Include background channel.
+</ParamField>
+
+<ParamField path="distance_metric" type="str" default="euclidean">
+  Distance function used to compute surface distances.
+</ParamField>
+
+<ParamField path="symmetric" type="bool" default="False">
+  If `True`, computes symmetric distance (average of both directions).
+</ParamField>
+
+---
+
+### SurfaceDiceMetric
+
+Computes the normalised surface Dice (NSD), which measures the fraction of boundary voxels within a tolerance distance.
+
+```python
+from monai.metrics import SurfaceDiceMetric
+
+metric = SurfaceDiceMetric(
+    include_background=False,
+    distance_thres=1.0,
+)
+```
+
+---
+
+### MeanIoU
+
+Computes Mean Intersection over Union (mIoU) for segmentation.
+
+```python
+from monai.metrics import MeanIoU
+
+metric = MeanIoU(include_background=False, reduction="mean")
+metric(y_pred=predictions, y=targets)
+miou = metric.aggregate()
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Include background class in the mean IoU.
+</ParamField>
+
+<ParamField path="reduction" type="str" default="mean">
+  Aggregation strategy.
+</ParamField>
+
+---
+
+### GeneralizedDiceScore
+
+Computes the Generalised Dice Score with class-frequency weighting.
+
+```python
+from monai.metrics import GeneralizedDiceScore
+
+metric = GeneralizedDiceScore(include_background=False)
+```
+
+---
+
+## Classification metrics
+
+### ROCAUCMetric
+
+Computes ROC-AUC for binary or multi-class classification.
+
+```python
+from monai.metrics import ROCAUCMetric
+
+metric = ROCAUCMetric(average="macro")
+
+for batch in val_loader:
+    probs = torch.softmax(model(batch["image"]), dim=1)
+    metric(y_pred=probs, y=batch["label"])
+
+auc = metric.aggregate()
+metric.reset()
+```
+
+<ParamField path="average" type="str" default="macro">
+  Averaging strategy: `"macro"`, `"micro"`, `"weighted"`, or `"none"` (per-class).
+</ParamField>
+
+---
+
+### ConfusionMatrixMetric
+
+Computes derived metrics (precision, recall, F1, specificity, etc.) from the confusion matrix.
+
+```python
+from monai.metrics import ConfusionMatrixMetric
+
+metric = ConfusionMatrixMetric(
+    include_background=False,
+    metric_name=["precision", "recall", "f1 score"],
+    reduction="mean",
+    compute_sample=True,
+)
+```
+
+<ParamField path="include_background" type="bool" default="True">
+  Include background class.
+</ParamField>
+
+<ParamField path="metric_name" type="str | Sequence[str]" default="hit_rate">
+  Metric(s) to derive. Options include `"sensitivity"`, `"specificity"`, `"precision"`, `"recall"`, `"f1 score"`, `"accuracy"`, `"balanced accuracy"`, `"matthews correlation coefficient"`.
+</ParamField>
+
+<ParamField path="reduction" type="str" default="mean">
+  Aggregation strategy.
+</ParamField>
+
+---
+
+### FBetaScore
+
+Computes the Fβ score (generalisation of F1 to other β values).
+
+```python
+from monai.metrics import FBetaScore
+
+metric = FBetaScore(beta=2.0)   # F2 score emphasises recall
+```
+
+<ParamField path="beta" type="float" required>
+  β controls the weight of recall relative to precision. β = 1 gives F1; β > 1 favours recall; β < 1 favours precision.
+</ParamField>
+
+---
+
+## Regression & image quality
+
+### SSIMMetric
+
+Structural Similarity Index Measure for image quality assessment.
+
+```python
+from monai.metrics import SSIMMetric
+
+metric = SSIMMetric(spatial_dims=3, data_range=1.0, reduction="mean")
+```
+
+### MSEMetric / MAEMetric / RMSEMetric / PSNRMetric
+
+Standard regression metrics for image reconstruction evaluation.
+
+```python
+from monai.metrics import PSNRMetric
+
+metric = PSNRMetric(max_val=1.0, reduction="mean")
+```
+
+---
+
+## Generative model metrics
+
+### FIDMetric
+
+Fréchet Inception Distance for evaluating generative model quality.
+
+```python
+from monai.metrics import FIDMetric
+
+metric = FIDMetric()
+fid_score = metric(real_features, synthetic_features)
+```
+
+### MMDMetric
+
+Maximum Mean Discrepancy for comparing distributions of real and generated images.
+
+---
+
+## Active learning metrics
+
+### VarianceMetric
+
+Measures prediction uncertainty for active learning sample selection.
+
+### LabelQualityScore
+
+Estimates annotation quality scores to identify potentially mislabelled examples.
+
+---
+
+## Base classes
+
+### CumulativeIterationMetric
+
+Base class for metrics that accumulate results over multiple batches. Subclass this to implement custom metrics.
+
+```python
+from monai.metrics import CumulativeIterationMetric
+
+class MyMetric(CumulativeIterationMetric):
+    def _compute_tensor(self, y_pred, y):
+        # compute per-batch metric tensor
+        ...
+
+    def aggregate(self, reduction=None):
+        data = self.get_buffer()
+        # aggregate across batches
+        ...
+```
+
+**Key methods**:
+- `__call__(y_pred, y)` — calls `_compute_tensor` and stores results.
+- `aggregate()` — computes and returns the final metric value.
+- `reset()` — clears the accumulated buffer.
+- `get_buffer()` — returns all accumulated per-batch results.

@@ -1,0 +1,524 @@
+---
+title: "Acceleration"
+description: "Speed up MONAI training and inference with AMP, CacheDataset, ThreadDataLoader, GPU transforms, distributed training, C++/CUDA extensions, NVTX profiling, and TF32."
+keywords: ["acceleration", "AMP", "mixed precision", "CacheDataset", "PersistentDataset", "ThreadDataLoader", "distributed training", "DDP", "NVTX", "TF32"]
+---
+
+## Overview
+
+MONAI provides multiple orthogonal strategies for accelerating training and inference.
+They can be combined for multiplicative speedups.
+
+<CardGroup cols={2}>
+  <Card title="Auto Mixed Precision" icon="bolt">
+    Halve memory and increase throughput on Volta+ GPUs with one flag.
+  </Card>
+  <Card title="CacheDataset / PersistentDataset" icon="database">
+    Eliminate redundant preprocessing by caching transforms in RAM or on disk.
+  </Card>
+  <Card title="ThreadDataLoader" icon="cpu">
+    Replace multiprocessing overhead with a lightweight thread when data fits in RAM.
+  </Card>
+  <Card title="GPU transforms" icon="microchip">
+    Move intensity transforms onto the GPU to overlap compute and I/O.
+  </Card>
+  <Card title="Distributed training" icon="server">
+    Scale across multiple GPUs or nodes with PyTorch DDP.
+  </Card>
+  <Card title="C++/CUDA extensions" icon="code">
+    Use optimised native ops for resampling, CRF, and bilateral filtering.
+  </Card>
+</CardGroup>
+
+---
+
+## Auto Mixed Precision (AMP)
+
+AMP runs the forward pass and loss in 16-bit floating point while keeping a 32-bit master copy
+of the weights. On Volta (V100) and later NVIDIA GPUs this roughly halves memory usage and can
+double throughput, with no change to model accuracy in practice.
+
+### Enabling AMP in SupervisedTrainer
+
+Set `amp=True`. The trainer automatically creates a `torch.cuda.amp.GradScaler` and wraps the
+forward and loss steps in `torch.autocast("cuda")`.
+
+```python
+from monai.engines import SupervisedTrainer
+
+trainer = SupervisedTrainer(
+    device=torch.device("cuda:0"),
+    max_epochs=200,
+    train_data_loader=train_loader,
+    network=model,
+    optimizer=optimizer,
+    loss_function=loss_fn,
+    amp=True,                   # enable AMP
+)
+trainer.run()
+```
+
+The same flag works for `SupervisedEvaluator`:
+
+```python
+evaluator = SupervisedEvaluator(
+    device=device,
+    val_data_loader=val_loader,
+    network=model,
+    inferer=sliding_window_inferer,
+    amp=True,
+)
+```
+
+### GradScaler and amp_kwargs
+
+The `GradScaler` is created automatically by `Trainer.run()` and stored as `trainer.scaler`.
+You can customise `torch.autocast` options via `amp_kwargs`:
+
+```python
+trainer = SupervisedTrainer(
+    ...,
+    amp=True,
+    amp_kwargs={"dtype": torch.bfloat16},   # use bfloat16 instead of float16
+)
+```
+
+### Manual AMP outside the engine
+
+```python
+from torch.cuda.amp import GradScaler, autocast
+
+scaler = GradScaler()
+
+for batch in train_loader:
+    optimizer.zero_grad()
+    with autocast():
+        pred = model(batch["image"].to(device))
+        loss = loss_fn(pred, batch["label"].to(device))
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+```
+
+---
+
+## CacheDataset vs PersistentDataset
+
+Pre-computing transforms is the single most impactful optimisation for I/O-bound pipelines.
+
+<Tabs>
+  <Tab title="CacheDataset">
+    Runs all **deterministic** transforms once at startup and caches the results in RAM.
+    Randomised transforms (augmentation) are applied on-the-fly each epoch.
+
+    ```python
+    from monai.data import CacheDataset
+
+    train_ds = CacheDataset(
+        data=data_dicts,
+        transform=train_transforms,
+        cache_rate=1.0,       # cache 100% of the dataset
+        num_workers=8,        # parallel workers for initial caching
+        copy_cache=False,     # avoid redundant copies (saves RAM)
+    )
+    ```
+
+    **When to use**: dataset fits in RAM and transforms include slow operations like resampling,
+    orientation normalisation, or intensity windowing.
+
+    **Limitation**: requires enough RAM to hold the entire preprocessed dataset.
+  </Tab>
+  <Tab title="PersistentDataset">
+    Same as `CacheDataset` but writes the cache to disk. Subsequent runs reload from disk,
+    skipping preprocessing entirely.
+
+    ```python
+    from monai.data import PersistentDataset
+
+    train_ds = PersistentDataset(
+        data=data_dicts,
+        transform=train_transforms,
+        cache_dir="/fast_nvme/monai_cache",   # SSD or NVMe recommended
+    )
+    ```
+
+    **When to use**: dataset is too large for RAM, or you want to amortise preprocessing cost
+    across multiple experiments with the same transforms.
+  </Tab>
+  <Tab title="SmartCacheDataset">
+    Keeps a rolling window of the dataset in RAM and replaces samples in the background. Useful
+    when the full dataset does not fit in RAM but you still want partial caching.
+
+    ```python
+    from monai.data import SmartCacheDataset
+
+    train_ds = SmartCacheDataset(
+        data=data_dicts,
+        transform=train_transforms,
+        replace_rate=0.2,        # replace 20% of cached items each epoch
+        cache_num=200,           # number of items to keep cached simultaneously
+        num_init_workers=8,
+        num_replace_workers=4,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### Performance comparison
+
+| Dataset class | RAM required | Startup time | Per-epoch cost |
+|---|---|---|---|
+| `Dataset` (baseline) | Minimal | Instant | Full preprocessing every epoch |
+| `CacheDataset` | Full preprocessed size | High (once) | Randomised transforms only |
+| `PersistentDataset` | Minimal | High (first run only) | Disk read + randomised transforms |
+| `SmartCacheDataset` | Partial | Medium | Partial refresh + randomised transforms |
+
+---
+
+## ThreadDataLoader
+
+PyTorch's `DataLoader` uses multiple **processes** for data loading. Each process has its own
+Python interpreter, which introduces inter-process communication (IPC) overhead.
+
+When all deterministic transforms have already been cached and only lightweight augmentations
+remain, MONAI's `ThreadDataLoader` replaces the process pool with a single **thread** running
+in the same process as the training loop. This eliminates IPC overhead and keeps GPU utilisation
+high.
+
+```python
+from monai.data import ThreadDataLoader, CacheDataset
+
+# First, cache all deterministic transforms
+train_ds = CacheDataset(
+    data=data_dicts,
+    transform=train_transforms,  # includes the slow deterministic transforms
+    cache_rate=1.0,
+    num_workers=8,
+)
+
+# Then use ThreadDataLoader for the actual training loop
+train_loader = ThreadDataLoader(
+    train_ds,
+    batch_size=4,
+    shuffle=True,
+    num_workers=0,    # ThreadDataLoader runs in a thread, not separate processes
+    buffer_size=2,    # number of batches to pre-fetch
+)
+```
+
+<Tip>
+  `ThreadDataLoader` is most effective when combined with `CacheDataset` or `PersistentDataset`
+  and GPU-based augmentation transforms. If transforms are CPU-heavy, multiprocessing `DataLoader`
+  may be faster.
+</Tip>
+
+---
+
+## GPU transforms
+
+Moving intensity and spatial transforms onto the GPU lets the data pipeline run concurrently with
+network forward/backward passes.
+
+```python
+import torch
+from monai.transforms import (
+    Compose, RandGaussianNoised, RandAdjustContrastd,
+    RandFlipd, RandRotate90d, ToDeviced,
+)
+
+# All transforms after ToDeviced run on the GPU
+gpu_augmentation = Compose([
+    ToDeviced(keys=["image", "label"], device="cuda:0"),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
+    RandGaussianNoised(keys="image", prob=0.15, mean=0.0, std=0.01),
+    RandAdjustContrastd(keys="image", prob=0.3, gamma=(0.5, 2.0)),
+])
+```
+
+Combine with `CacheDataset` to cache preprocessing on CPU and apply augmentation on GPU:
+
+```python
+# Cache deterministic CPU transforms
+train_ds = CacheDataset(data=data_dicts, transform=cpu_transforms, cache_rate=1.0)
+
+# Apply GPU augmentation inside the training loop
+for batch in ThreadDataLoader(train_ds, batch_size=4, num_workers=0):
+    batch = gpu_augmentation(batch)
+    pred  = model(batch["image"])
+    loss  = loss_fn(pred, batch["label"])
+    ...
+```
+
+---
+
+## Distributed training
+
+### Setup with DistributedSampler
+
+`Workflow` automatically detects a `DistributedSampler` and calls `sampler.set_epoch()` at the
+start of each epoch so that each rank sees a different shuffle.
+
+```python
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from monai.engines import SupervisedTrainer
+
+# 1. Initialise the process group
+dist.init_process_group(backend="nccl")
+local_rank = dist.get_rank()
+torch.cuda.set_device(local_rank)
+device = torch.device(f"cuda:{local_rank}")
+
+# 2. Wrap model with DDP
+model = UNet(...).to(device)
+model = DDP(model, device_ids=[local_rank])
+
+# 3. Create a DistributedSampler for the training loader
+train_sampler = DistributedSampler(train_dataset, shuffle=True)
+train_loader  = DataLoader(
+    train_dataset,
+    batch_size=2,
+    sampler=train_sampler,    # replaces shuffle=True
+    num_workers=4,
+    pin_memory=True,
+)
+
+# 4. Build trainer — it detects the DistributedSampler automatically
+trainer = SupervisedTrainer(
+    device=device,
+    max_epochs=200,
+    train_data_loader=train_loader,
+    network=model,
+    optimizer=optimizer,
+    loss_function=loss_fn,
+    amp=True,
+)
+trainer.run()
+
+dist.destroy_process_group()
+```
+
+### Launching distributed jobs
+
+<Tabs>
+  <Tab title="torchrun (recommended)">
+    ```bash
+    torchrun \
+      --nproc_per_node=4 \
+      --nnodes=1 \
+      train.py
+    ```
+  </Tab>
+  <Tab title="torch.distributed.launch (legacy)">
+    ```bash
+    python -m torch.distributed.launch \
+      --nproc_per_node=4 \
+      train.py
+    ```
+  </Tab>
+  <Tab title="SLURM">
+    ```bash
+    srun --ntasks-per-node=4 --gpus-per-node=4 python train.py
+    ```
+
+    Inside the script, read `SLURM_PROCID` and `SLURM_LOCALID` to set `RANK` and `LOCAL_RANK`.
+  </Tab>
+</Tabs>
+
+<Warning>
+  When using `DistributedSampler`, do **not** set `shuffle=True` in the `DataLoader`.
+  Shuffling is handled by `sampler.set_epoch()`.
+</Warning>
+
+---
+
+## C++/CUDA extensions
+
+MONAI ships optional C++/CUDA extensions that accelerate specific operations significantly beyond
+what PyTorch's native ops achieve. Build them by setting `BUILD_MONAI=1` before installation.
+
+```bash
+BUILD_MONAI=1 pip install monai
+# or from source:
+BUILD_MONAI=1 python setup.py develop
+```
+
+### Available extensions
+
+<AccordionGroup>
+  <Accordion title="Resampler">
+    High-performance image resampling using CUDA-accelerated interpolation kernels.
+    Useful as a drop-in replacement for `monai.transforms.Spacingd` when resampling
+    is a bottleneck.
+
+    ```python
+    from monai.transforms import Spacingd
+    # Uses the C++ Resampler automatically when the extension is built and inputs are on GPU
+    t = Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0))
+    ```
+  </Accordion>
+
+  <Accordion title="Conditional Random Field (CRF)">
+    Fully connected CRF post-processing for refining segmentation boundaries, implemented as a
+    CUDA extension. Much faster than the CPU reference implementation on large 3D volumes.
+
+    ```python
+    from monai.networks.blocks import CRF
+
+    crf = CRF(
+        iterations=5,
+        bilateral_weight=5.0,
+        gaussian_weight=3.0,
+        bilateral_spatial_sigma=1.0,
+        bilateral_color_sigma=5.0,
+        gaussian_spatial_sigma=0.5,
+        update_factor=3.0,
+        compatibility_matrix=None,
+    )
+    refined = crf(pred_logits, image)
+    ```
+  </Accordion>
+
+  <Accordion title="Fast bilateral filtering">
+    Permutohedral-lattice bilateral filtering for edge-preserving smoothing or feature
+    extraction. Built via `setuptools` alongside `Resampler` and `CRF`.
+  </Accordion>
+
+  <Accordion title="Gaussian mixtures (JIT)">
+    Gaussian mixture model operations compiled just-in-time using PyTorch's JIT infrastructure.
+    Used for probabilistic atlas-based tissue segmentation.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## NVTX profiling markers
+
+MONAI provides `NvtxHandler` wrappers that insert NVIDIA NVTX range markers around engine
+events. These appear in Nsight Systems and DLProf traces as labelled intervals.
+
+```python
+from monai.handlers import RangeHandler, MarkHandler
+
+trainer = SupervisedTrainer(
+    ...,
+    train_handlers=[
+        RangeHandler(msg="iteration"),   # wraps each ITERATION_STARTED/COMPLETED pair
+        MarkHandler(msg="epoch_end"),    # places a point marker at EPOCH_COMPLETED
+    ],
+)
+```
+
+Profile with Nsight Systems:
+
+```bash
+nsys profile --trace=cuda,nvtx \
+             --output=./profile_output \
+             python train.py
+```
+
+---
+
+## TF32 on Ampere GPUs
+
+NVIDIA Ampere (A100) and later GPUs support TensorFloat-32 (TF32) — a 19-bit internal format
+used for matrix multiplications that gives roughly the same accuracy as FP32 with the throughput
+of FP16. PyTorch enables TF32 by default for `torch.matmul` and cuDNN convolutions.
+
+```python
+import torch
+
+# Verify TF32 is enabled (default on Ampere)
+print(torch.backends.cuda.matmul.allow_tf32)   # True
+print(torch.backends.cudnn.allow_tf32)         # True
+
+# Disable if you need strict FP32 for reproducibility
+torch.backends.cuda.matmul.allow_tf32  = False
+torch.backends.cudnn.allow_tf32        = False
+```
+
+<Note>
+  AMP (float16) generally outperforms TF32 in throughput, but TF32 requires no code changes and
+  is a free win on A100 when you are not yet using AMP.
+</Note>
+
+---
+
+## Practical tips
+
+<AccordionGroup>
+  <Accordion title="Batch size tuning">
+    Larger batch sizes improve GPU utilisation but may require learning rate adjustment
+    (linear scaling rule: `lr *= batch_size / base_batch_size`).
+
+    Use `SupervisedTrainer`'s `accumulation_steps` to simulate larger batches without
+    increasing actual memory consumption:
+
+    ```python
+    trainer = SupervisedTrainer(
+        ...,
+        accumulation_steps=8,   # effective batch = batch_size * 8
+        amp=True,
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="num_workers">
+    - Start with `num_workers = min(8, os.cpu_count())`.
+    - With `CacheDataset` + `ThreadDataLoader`, set `num_workers=0`.
+    - With `PersistentDataset` (disk reads), use 4–8 workers.
+    - Too many workers causes context-switch overhead; profile to find the sweet spot.
+  </Accordion>
+
+  <Accordion title="pin_memory">
+    Set `pin_memory=True` in `DataLoader` when training on GPU. This pages host memory into
+    pinned (non-pageable) memory, enabling faster asynchronous host→device transfers.
+
+    ```python
+    loader = DataLoader(dataset, batch_size=4, pin_memory=True, num_workers=4)
+    ```
+  </Accordion>
+
+  <Accordion title="Persistent workers">
+    Set `persistent_workers=True` to keep the worker pool alive between epochs and avoid the
+    overhead of restarting processes:
+
+    ```python
+    loader = DataLoader(
+        dataset, batch_size=4, num_workers=4,
+        persistent_workers=True,
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="SlidingWindowInferer memory">
+    - Use `device="cpu"` for output stitching when volumes are very large.
+    - Enable `cache_roi_weight_map=True` with `mode="gaussian"` to precompute the weight map.
+    - Use `SlidingWindowInfererAdapt` to automatically fall back to CPU stitching on OOM.
+    - Increase `sw_batch_size` to process more windows per forward call (uses more VRAM).
+  </Accordion>
+
+  <Accordion title="Profiling workflow">
+    <Steps>
+      <Step title="Baseline">
+        Run with `nsys profile` to get a baseline trace. Identify the largest gaps on the GPU timeline.
+      </Step>
+      <Step title="Add NVTX markers">
+        Attach `RangeHandler` to the trainer to label events in the trace.
+      </Step>
+      <Step title="Enable AMP">
+        Check whether AMP increases GPU compute utilisation; look for reduced kernel durations.
+      </Step>
+      <Step title="Cache data">
+        If the data pipeline is the bottleneck, switch to `CacheDataset` + `ThreadDataLoader`.
+      </Step>
+      <Step title="GPU transforms">
+        If augmentation is still a bottleneck after caching, move it to the GPU.
+      </Step>
+    </Steps>
+  </Accordion>
+</AccordionGroup>
